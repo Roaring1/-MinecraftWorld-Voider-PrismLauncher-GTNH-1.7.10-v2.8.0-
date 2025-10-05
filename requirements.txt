@@ -1,0 +1,7 @@
+
+---
+
+## `requirements.txt`
+
+```txt
+NBT>=1.5.1
