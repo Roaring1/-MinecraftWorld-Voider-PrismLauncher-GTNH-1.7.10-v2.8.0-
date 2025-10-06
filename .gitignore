@@ -1,15 +1,37 @@
+
+# .gitignore
+```gitignore
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
+*.egg-info/
+.eggs/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environments
+.venv/
+venv/
+env/
 
 # PyInstaller
 build/
 dist/
 *.spec
+*.manifest
 
 # App artifacts
 *.void-backup.zip
 *.mca.bak
 *.config.json
+*.log
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
