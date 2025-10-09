@@ -1,0 +1,603 @@
+#!/usr/bin/env python3
+# 8/10/2025-2
+# Chunk Map UI for the GTNH 1.7.x Voider — top-down selector for chunks
+# - Per-dimension picker (e.g., region/, DIM-1/region, DIM1/region, etc.)
+# - Grid is chunk-accurate; region math = floor(chunk/32) and 32×32 per region.
+# - Panning (RMB or MMB drag), zoom (mouse wheel), select (LMB click/drag).
+# - Include / Exclude modes; Ctrl toggles, Shift adds to current box.
+# - Highlights chunks that actually exist on disk (parsed from .mca headers).
+# - Saves JSON to {world}/.voider-selection.json and returns dict to caller.
+#
+# How to use (standalone):
+#   py chunkmap_ui.py "C:\\...\\saves\\YourWorld" [DIMTAG]
+#
+# How to call from your main script (back-compat with your stub):
+#   import chunkmap_ui
+#   data = chunkmap_ui.open_chunkmap_and_get_selection(world_path, tags)  # returns dict
+#
+# References:
+# - Region files group 32×32 chunks, mapping via floor(chunk/32). (Minecraft Wiki)
+#   https://minecraft.fandom.com/wiki/Region_file_format
+
+import os
+import sys
+import math
+import json
+import struct
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Set
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import tkinter.font as tkfont
+
+SECTOR_BYTES = 4096
+
+# ---------- region helpers ----------
+def _read_header(fp) -> Tuple[List[int], List[int]]:
+    fp.seek(0)
+    hdr = fp.read(8192)
+    if len(hdr) != 8192:
+        raise IOError("bad region header size")
+    offsets = [struct.unpack(">I", hdr[i*4:(i+1)*4])[0] for i in range(1024)]
+    stamps  = [struct.unpack(">I", hdr[4096+i*4:4096+(i+1)*4])[0] for i in range(1024)]
+    return offsets, stamps
+
+def _parse_loc(entry:int) -> Tuple[int,int]:
+    return (entry >> 8) & 0xFFFFFF, entry & 0xFF
+
+def _region_coords_from_name(path:Path) -> Tuple[int,int]:
+    # r.<rx>.<rz>.mca
+    try:
+        _, rx, rz = path.stem.split(".")
+        return int(rx), int(rz)
+    except Exception:
+        raise ValueError(f"Bad region filename: {path.name}")
+
+def _iter_present_chunks_in_region(mca_path:Path) -> List[Tuple[int,int]]:
+    """Return absolute chunk (cx,cz) that exist in this region file (not empty)."""
+    present = []
+    rx, rz = _region_coords_from_name(mca_path)
+    with open(mca_path, "rb") as fp:
+        # sanity: ensure location entry points into file
+        fp.seek(0, os.SEEK_END)
+        fsize = fp.tell()
+        fp.seek(0)
+        offsets, _ = _read_header(fp)
+        for idx, entry in enumerate(offsets):
+            if entry == 0:
+                continue
+            off, cnt = _parse_loc(entry)
+            if off == 0 or cnt == 0:
+                continue
+            abs_pos = off * SECTOR_BYTES
+            if abs_pos + 5 > fsize:
+                continue
+            cx_local = idx % 32
+            cz_local = idx // 32
+            cx_abs   = rx*32 + cx_local
+            cz_abs   = rz*32 + cz_local
+            present.append((cx_abs, cz_abs))
+    return present
+
+def _find_region_dirs(world:Path) -> List[Path]:
+    out=[]
+    for p in world.rglob("region"):
+        if p.is_dir() and p.parent.name not in ("entities","poi"):
+            out.append(p)
+    out.sort()
+    return out
+
+def _dim_tag(world:Path, rdir:Path) -> str:
+    return str(rdir.relative_to(world)).replace("\\","/")
+
+# ---------- selection model ----------
+class Selection:
+    """Keep per-dim include/exclude sets of chunk tuples."""
+    def __init__(self):
+        self.by_dim: Dict[str, Dict[str, Set[Tuple[int,int]]]] = {}
+
+    def ensure_dim(self, dim:str):
+        if dim not in self.by_dim:
+            self.by_dim[dim] = {"include": set(), "exclude": set()}
+
+    def add(self, dim:str, coord:Tuple[int,int], mode:str):
+        self.ensure_dim(dim)
+        if mode == "include":
+            self.by_dim[dim]["include"].add(coord)
+            self.by_dim[dim]["exclude"].discard(coord)
+        elif mode == "exclude":
+            self.by_dim[dim]["exclude"].add(coord)
+            self.by_dim[dim]["include"].discard(coord)
+
+    def add_rect(self, dim:str, x1:int, z1:int, x2:int, z2:int, mode:str):
+        self.ensure_dim(dim)
+        minx, maxx = (x1, x2) if x1<=x2 else (x2, x1)
+        minz, maxz = (z1, z2) if z1<=z2 else (z2, z1)
+        target = self.by_dim[dim]["include"] if mode=="include" else self.by_dim[dim]["exclude"]
+        other  = self.by_dim[dim]["exclude"] if mode=="include" else self.by_dim[dim]["include"]
+        for cx in range(minx, maxx+1):
+            for cz in range(minz, maxz+1):
+                target.add((cx,cz))
+                other.discard((cx,cz))
+
+    def to_json_simple(self) -> Dict[str, Dict[str, List[List[int]]]]:
+        """Top-level dict per-dim — compatible with main voider script."""
+        out: Dict[str, Dict[str, List[List[int]]]] = {}
+        for dim, d in self.by_dim.items():
+            out[dim] = {
+                "include": sorted([list(t) for t in d["include"]]),
+                "exclude": sorted([list(t) for t in d["exclude"]]),
+            }
+        return out
+
+    def from_json(self, data:Dict):
+        """Load both simple (top-level per-dim) and versioned {'by_dim': ...} formats."""
+        self.by_dim.clear()
+        if not data:
+            return
+        bd = data.get("by_dim", None)
+        mapping = bd if isinstance(bd, dict) else data
+        for dim, d in mapping.items():
+            inc = set(tuple(x) for x in d.get("include", []))
+            exc = set(tuple(x) for x in d.get("exclude", []))
+            self.by_dim[dim] = {"include": inc, "exclude": exc}
+
+# ---------- Canvas view ----------
+class ChunkCanvas(ttk.Frame):
+    def __init__(self, master, world:Path, dimtag:str, present_chunks:Set[Tuple[int,int]], selection:Selection):
+        super().__init__(master)
+        self.world = world
+        self.dimtag = dimtag
+        self.present = present_chunks  # set of (cx,cz) present on disk
+        self.sel = selection
+
+        # view state
+        self.scale = 24.0  # pixels per chunk
+        self.cam_x = 0.0   # top-left in chunk coords
+        self.cam_z = 0.0
+
+        if present_chunks:
+            xs = [c[0] for c in present_chunks]
+            zs = [c[1] for c in present_chunks]
+            minx, maxx = min(xs), max(xs)
+            minz, maxz = min(zs), max(zs)
+            pad = 8
+            self.cam_x = float(minx - pad)
+            self.cam_z = float(minz - pad)
+        else:
+            self.cam_x = -16.0
+            self.cam_z = -16.0
+
+        # theme colors
+        self.bg = self.master.colors["BG"]
+        self.fg = self.master.colors["Text"]
+        self.grid_c = "#384552" if not self.master.is_light else "#d0d7de"
+        self.exist_c = "#244a61" if not self.master.is_light else "#b6dfff"
+        self.sel_inc_c = "#3fb950" if not self.master.is_light else "#22863a"
+        self.sel_exc_c = "#f85149" if not self.master.is_light else "#d1242f"
+        self.axis_c = "#8b949e" if not self.master.is_light else "#57606a"
+
+        # canvas + scrollbars
+        self.canvas = tk.Canvas(self, bg=self.bg, highlightthickness=0, bd=0, cursor="crosshair")
+        self.hbar = ttk.Scrollbar(self, orient="horizontal", command=self._xscroll)
+        self.vbar = ttk.Scrollbar(self, orient="vertical", command=self._yscroll)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.vbar.grid(row=0, column=1, sticky="ns")
+        self.hbar.grid(row=1, column=0, sticky="ew")
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+
+        # mouse + keys
+        self.canvas.bind("<Configure>", self._on_resize)
+        self.canvas.bind("<Button-1>", self._on_lmb_down)
+               self.canvas.bind("<B1-Motion>", self._on_lmb_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_lmb_up)
+        self.canvas.bind("<Button-2>", self._on_pan_start)
+        self.canvas.bind("<B2-Motion>", self._on_pan_move)
+        self.canvas.bind("<Button-3>", self._on_pan_start)
+        self.canvas.bind("<B3-Motion>", self._on_pan_move)
+        self.canvas.bind("<MouseWheel>", self._on_wheel)     # Windows/macOS
+        self.canvas.bind("<Button-4>", self._on_wheel_up)    # Linux X11
+        self.canvas.bind("<Button-5>", self._on_wheel_down)
+
+        self.drag_start = None
+        self.drag_rect = None
+
+        self._redraw_all()
+
+    # transforms
+    def scr_to_chunk(self, sx:float, sy:float) -> Tuple[int,int]:
+        cx = math.floor(self.cam_x + sx / self.scale)
+        cz = math.floor(self.cam_z + sy / self.scale)
+        return cx, cz
+
+    def chunk_to_scr(self, cx:int, cz:int) -> Tuple[float,float]:
+        sx = (cx - self.cam_x) * self.scale
+        sy = (cz - self.cam_z) * self.scale
+        return sx, sy
+
+    # scrolling
+    def _xscroll(self, *args):
+        if args[0] == "moveto":
+            frac = float(args[1])
+            self.cam_x = -2048 + frac * 4096
+        elif args[0] == "scroll":
+            units = int(args[1])
+            self.cam_x += units * (self.canvas.winfo_width() / self.scale) * 0.1
+        self._redraw_all()
+
+    def _yscroll(self, *args):
+        if args[0] == "moveto":
+            frac = float(args[1])
+            self.cam_z = -2048 + frac * 4096
+        elif args[0] == "scroll":
+            units = int(args[1])
+            self.cam_z += units * (self.canvas.winfo_height() / self.scale) * 0.1
+        self._redraw_all()
+
+    # events
+    def _on_resize(self, _):
+        self._redraw_all()
+
+    def _on_wheel(self, ev):
+        delta = 1 if ev.delta > 0 else -1
+        self._zoom_at(ev.x, ev.y, delta)
+
+    def _on_wheel_up(self, ev):
+        self._zoom_at(ev.x, ev.y, +1)
+
+    def _on_wheel_down(self, ev):
+        self._zoom_at(ev.x, ev.y, -1)
+
+    def _zoom_at(self, sx:int, sy:int, direction:int):
+        old_scale = self.scale
+        factor = 1.15 if direction > 0 else (1/1.15)
+        new_scale = min(96.0, max(6.0, old_scale * factor))
+        if abs(new_scale - old_scale) < 1e-6:
+            return
+        before_cx = self.cam_x + sx / old_scale
+        before_cz = self.cam_z + sy / old_scale
+        self.scale = new_scale
+        self.cam_x = before_cx - sx / new_scale
+        self.cam_z = before_cz - sy / new_scale
+        self._redraw_all()
+
+    def _on_pan_start(self, ev):
+        self._pan_anchor = (ev.x, ev.y, self.cam_x, self.cam_z)
+
+    def _on_pan_move(self, ev):
+        ax, ay, ox, oz = self._pan_anchor
+        dx = (ev.x - ax) / self.scale
+        dz = (ev.y - ay) / self.scale
+        self.cam_x = ox - dx
+        self.cam_z = oz - dz
+        self._redraw_all()
+
+    def _on_lmb_down(self, ev):
+        self.drag_start = self.scr_to_chunk(ev.x, ev.y)
+        if self.drag_rect is not None:
+            self.canvas.delete(self.drag_rect)
+            self.drag_rect = None
+
+    def _on_lmb_drag(self, ev):
+        if not self.drag_start:
+            return
+        cx1, cz1 = self.drag_start
+        cx2, cz2 = self.scr_to_chunk(ev.x, ev.y)
+        x1, y1 = self.chunk_to_scr(min(cx1,cx2), min(cz1,cz2))
+        x2, y2 = self.chunk_to_scr(max(cx1,cx2)+1, max(cz1,cz2)+1)
+        if self.drag_rect is not None:
+            self.canvas.coords(self.drag_rect, x1, y1, x2, y2)
+        else:
+            self.drag_rect = self.canvas.create_rectangle(
+                x1, y1, x2, y2, outline=self.master.colors["ACCENT"], width=2, dash=(4,2)
+            )
+
+    def _on_lmb_up(self, ev):
+        if not self.drag_start:
+            return
+        cx1, cz1 = self.drag_start
+        cx2, cz2 = self.scr_to_chunk(ev.x, ev.y)
+        self.drag_start = None
+        if self.drag_rect is not None:
+            self.canvas.delete(self.drag_rect)
+            self.drag_rect = None
+
+        mode = self.master.mode_var.get()
+        ctrl_down = (ev.state & 0x0004) != 0
+        if (abs(cx2 - cx1) <= 0) and (abs(cz2 - cz1) <= 0):
+            if ctrl_down:
+                mode = "exclude" if mode == "include" else "include"
+            self.sel.add(self.dimtag, (cx1, cz1), mode)
+        else:
+            self.sel.add_rect(self.dimtag, cx1, cz1, cx2, cz2, mode)
+
+        self._redraw_all()
+
+    # drawing
+    def _visible_chunk_bounds(self) -> Tuple[int,int,int,int]:
+        w = max(1, self.canvas.winfo_width())
+        h = max(1, self.canvas.winfo_height())
+        cx_min = math.floor(self.cam_x)
+        cz_min = math.floor(self.cam_z)
+        cx_max = math.floor(self.cam_x + w / self.scale)
+        cz_max = math.floor(self.cam_z + h / self.scale)
+        return cx_min-1, cz_min-1, cx_max+1, cz_max+1
+
+    def _draw_grid(self):
+        w = self.canvas.winfo_width()
+        h = self.canvas.winfo_height()
+        cx0, cz0, cx1, cz1 = self._visible_chunk_bounds()
+
+        for cx in range(cx0, cx1+1):
+            sx, _ = self.chunk_to_scr(cx, cz0)
+            self.canvas.create_line(sx, 0, sx, h, fill=self.grid_c)
+        for cz in range(cz0, cz1+1):
+            _, sy = self.chunk_to_scr(cx0, cz)
+            self.canvas.create_line(0, sy, w, sy, fill=self.grid_c)
+
+        sx0, sy0 = self.chunk_to_scr(0, 0)
+        self.canvas.create_line(sx0, 0, sx0, h, fill=self.axis_c)
+        self.canvas.create_line(0, sy0, w, sy0, fill=self.axis_c)
+        self.canvas.create_text(sx0+6, sy0+12, text="(0,0)", fill=self.axis_c, anchor="nw")
+
+    def _draw_present(self):
+        if not self.present:
+            return
+        cx0, cz0, cx1, cz1 = self._visible_chunk_bounds()
+        for (cx, cz) in self.present:
+            if cx0 <= cx <= cx1 and cz0 <= cz <= cz1:
+                x1, y1 = self.chunk_to_scr(cx, cz)
+                x2, y2 = self.chunk_to_scr(cx+1, cz+1)
+                self.canvas.create_rectangle(x1, y1, x2, y2, fill=self.exist_c, outline="")
+
+    def _draw_selection(self):
+        self.sel.ensure_dim(self.dimtag)
+        inc = self.sel.by_dim[self.dimtag]["include"]
+        exc = self.sel.by_dim[self.dimtag]["exclude"]
+        cx0, cz0, cx1, cz1 = self._visible_chunk_bounds()
+        for (cx, cz) in inc:
+            if cx0 <= cx <= cx1 and cz0 <= cz <= cz1:
+                x1, y1 = self.chunk_to_scr(cx, cz)
+                x2, y2 = self.chunk_to_scr(cx+1, cz+1)
+                self.canvas.create_rectangle(x1, y1, x2, y2, outline=self.sel_inc_c, width=2)
+        for (cx, cz) in exc:
+            if cx0 <= cx <= cx1 and cz0 <= cz <= cz1:
+                x1, y1 = self.chunk_to_scr(cx, cz)
+                x2, y2 = self.chunk_to_scr(cx+1, cz+1)
+                self.canvas.create_rectangle(x1, y1, x2, y2, outline=self.sel_exc_c, width=2)
+
+    def _redraw_all(self):
+        self.canvas.delete("all")
+        self._draw_present()
+        self._draw_grid()
+        self._draw_selection()
+
+# ---------- Main window ----------
+class ChunkMapWindow(tk.Toplevel):
+    def __init__(self, root, world:Path, colors:Dict[str,str], is_light:bool,
+                 dims:List[Path], initial_dim:str, preload:Optional[Dict]):
+        super().__init__(root)
+        self.world = world
+        self.colors = colors
+        self.is_light = is_light
+        self.title("Voider — Chunk Selector")
+        self.geometry("1000x720")
+        self.minsize(800, 600)
+
+        self.selection = Selection()
+        if preload:
+            self.selection.from_json(preload)
+
+        style = ttk.Style(self)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        style.configure("TFrame", background=colors["BG"])
+        style.configure("TLabelframe", background=colors["BG"], foreground=colors["Text"])
+        style.configure("TLabel", background=colors["BG"], foreground=colors["Text"])
+        style.configure("TButton", background=colors["Panel"], foreground=colors["Text"])
+        style.configure("Accent.TButton", background=colors["ACCENT"], foreground="#0b0e14" if not is_light else "#000000")
+        style.configure("TCombobox", fieldbackground=colors["InputBG"], foreground=colors["InputText"])
+
+        top = ttk.Frame(self); top.pack(fill="x", padx=10, pady=8)
+        ttk.Label(top, text="Dimension:").pack(side="left")
+        self.dim_combo = ttk.Combobox(top, state="readonly", width=40)
+        self.dim_combo.pack(side="left", padx=6)
+        self.mode_var = tk.StringVar(value="include")
+        ttk.Radiobutton(top, text="Include", value="include", variable=self.mode_var).pack(side="left", padx=(12,4))
+        ttk.Radiobutton(top, text="Exclude", value="exclude", variable=self.mode_var).pack(side="left")
+
+        self.btn_clear = ttk.Button(top, text="Clear", command=self._clear_current); self.btn_clear.pack(side="left", padx=(12,4))
+        self.btn_load  = ttk.Button(top, text="Load…", command=self._load_json);    self.btn_load.pack(side="left", padx=4)
+        self.btn_save  = ttk.Button(top, text="Save",  command=self._save_json);     self.btn_save.pack(side="left", padx=4)
+        self.btn_done  = ttk.Button(top, text="Save & Close", style="Accent.TButton", command=self._done); self.btn_done.pack(side="right")
+
+        helpf = ttk.Frame(self); helpf.pack(fill="x", padx=10)
+        ttk.Label(helpf, text="LMB: select (drag for box) • Ctrl+click inverts target • RMB/MMB: pan • Wheel: zoom • Include=green, Exclude=red").pack(anchor="w")
+
+        self.dim_to_dir: Dict[str, Path] = {}
+        dimtags=[]
+        for rdir in dims:
+            tag = _dim_tag(world, rdir)
+            dimtags.append(tag)
+            self.dim_to_dir[tag] = rdir
+        dimtags.sort()
+        self.dim_combo["values"] = dimtags
+        if initial_dim in dimtags:
+            self.dim_combo.set(initial_dim)
+        elif dimtags:
+            self.dim_combo.set(dimtags[0])
+
+        self.canvas_holder = ttk.Frame(self); self.canvas_holder.pack(fill="both", expand=True, padx=10, pady=10)
+        self.current_canvas: Optional[ChunkCanvas] = None
+
+        self.dim_combo.bind("<<ComboboxSelected>>", self._on_dim_changed)
+        self._on_dim_changed()
+
+    def _scan_present(self, rdir:Path) -> Set[Tuple[int,int]]:
+        present=set()
+        files = [p for p in rdir.iterdir() if p.suffix==".mca" and p.name.startswith("r.")]
+        for mca in files:
+            try:
+                for c in _iter_present_chunks_in_region(mca):
+                    present.add(c)
+            except Exception:
+                pass
+        return present
+
+    def _on_dim_changed(self, *_):
+        for c in self.canvas_holder.winfo_children():
+            c.destroy()
+        dimtag = self.dim_combo.get()
+        rdir = self.dim_to_dir.get(dimtag)
+        present = self._scan_present(rdir) if rdir else set()
+        self.current_canvas = ChunkCanvas(self.canvas_holder, self.world, dimtag, present, self.selection)
+        self.current_canvas.master = self
+        self.current_canvas.pack(fill="both", expand=True)
+
+    def _clear_current(self):
+        dim = self.dim_combo.get()
+        if not dim: return
+        self.selection.ensure_dim(dim)
+        self.selection.by_dim[dim]["include"].clear()
+        self.selection.by_dim[dim]["exclude"].clear()
+        if self.current_canvas: self.current_canvas._redraw_all()
+
+    def _load_json(self):
+        p = filedialog.askopenfilename(title="Load selection JSON", filetypes=[("JSON","*.json"), ("All","*.*")])
+        if not p: return
+        try:
+            data=json.loads(Path(p).read_text(encoding="utf-8"))
+            self.selection.from_json(data)
+            if self.current_canvas: self.current_canvas._redraw_all()
+        except Exception as e:
+            messagebox.showerror("Load failed", str(e))
+
+    def _save_json(self):
+        try:
+            data = self.selection.to_json_simple()
+            default_path = self.world/".voider-selection.json"
+            Path(default_path).write_text(json.dumps(data, indent=2), encoding="utf-8")
+            messagebox.showinfo("Saved", f"Wrote {default_path}")
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+
+    def _done(self):
+        try:
+            data = self.selection.to_json_simple()
+            (self.world/".voider-selection.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        self.destroy()
+
+# ---------- public API ----------
+def _detect_theme_colors() -> Tuple[Dict[str,str], bool]:
+    DARK = {
+        "BG": "#0d1117",
+        "Panel": "#0f141b",
+        "Text": "#e6edf3",
+        "Subtle": "#9aa6b2",
+        "InputBG": "#0b0f14",
+        "InputText": "#e6edf3",
+        "Border": "#2b3138",
+        "ACCENT": "#4aa3ff",
+    }
+    LIGHT = {
+        "BG": "#f3f3f3",
+        "Panel": "#ffffff",
+        "Text": "#1b1b1b",
+        "Subtle": "#5a5a5a",
+        "InputBG": "#ffffff",
+        "InputText": "#1b1b1b",
+        "Border": "#d0d0d0",
+        "ACCENT": "#0a84ff",
+    }
+    # Tk cross-platform detection is spotty; default to DARK for consistency
+    return DARK, False
+
+def _discover_dims(world:Path, limit_tags:Optional[List[str]] = None) -> List[Path]:
+    dirs = _find_region_dirs(world)
+    if limit_tags:
+        want = {t.strip().lower() for t in limit_tags}
+        dirs = [d for d in dirs if _dim_tag(world,d).lower() in want]
+    return dirs
+
+def _load_preexisting_selection(world:Path, preload:Optional[Dict]) -> Optional[Dict]:
+    if preload:
+        return preload
+    p = world/".voider-selection.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+    return None
+
+def launch_chunk_selector(world_path:str,
+                          initial_dim:Optional[str]=None,
+                          preload:Optional[Dict]=None,
+                          tags:Optional[List[str]]=None) -> Dict[str, Dict[str, List[List[int]]]]:
+    """
+    Open the UI, block until closed, return JSON selection dict in the simple format:
+      { "<dimtag>": { "include": [[cx,cz],...], "exclude": [[cx,cz],...] }, ... }
+    """
+    world = Path(world_path)
+    if not (world/"level.dat").exists():
+        raise SystemExit("level.dat not found — point to a valid world folder.")
+
+    dims = _discover_dims(world, limit_tags=tags)
+    if not dims:
+        raise SystemExit("No region folders found under this world (or after filtering).")
+
+    colors, is_light = _detect_theme_colors()
+    root = tk.Tk()
+    # base font
+    try:
+        base = tkfont.nametofont("TkDefaultFont")
+        family = "Segoe UI" if "Segoe UI" in tkfont.families() else base.cget("family")
+        base.configure(family=family, size=11)
+        root.option_add("*Font", base)
+    except Exception:
+        pass
+    root.withdraw()
+
+    preload_data = _load_preexisting_selection(world, preload)
+    initial = initial_dim or _dim_tag(world, dims[0])
+
+    win = ChunkMapWindow(root, world, colors, is_light, dims, initial_dim=initial, preload=preload_data)
+    win.colors = colors
+    win.is_light = is_light
+
+    win.grab_set()
+    root.wait_window(win)
+
+    sel = win.selection.to_json_simple()
+    try:
+        (world/".voider-selection.json").write_text(json.dumps(sel, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    root.destroy()
+    return sel
+
+# Back-compat shim for your main script’s call-site:
+def open_chunkmap_and_get_selection(world_path:str, tags:Optional[List[str]] = None) -> Dict[str, Dict[str, List[List[int]]]]:
+    """Compatibility wrapper: same return format your main script expects."""
+    return launch_chunk_selector(world_path=world_path, initial_dim=(tags[0] if tags else None), tags=tags)
+
+# ---------- CLI entry ----------
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="Chunk Map UI for GTNH Voider — select chunks to include/exclude.")
+    ap.add_argument("world", help="Path to world folder (contains level.dat)")
+    ap.add_argument("--dim", help="Initial dimension tag (e.g., region, DIM-1/region, DIM1/region)")
+    ap.add_argument("--limit", help="Comma-separated list of dimension tags to allow (filters the list)")
+    args = ap.parse_args()
+
+    world = args.world
+    initial = args.dim
+    tags = [t.strip() for t in args.limit.split(",")] if args.limit else None
+
+    sel = launch_chunk_selector(world, initial_dim=initial, tags=tags)
+    print(json.dumps(sel, indent=2))
+    print(f"\nSelection saved to: {Path(world)/'.voider-selection.json'}")
