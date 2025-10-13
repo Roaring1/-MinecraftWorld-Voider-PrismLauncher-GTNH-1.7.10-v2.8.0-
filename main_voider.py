@@ -16,7 +16,40 @@ from typing import Optional, Tuple, List, Dict, Set, Callable
 
 # Third-party / sibling
 from nbt import nbt
-from chunkmap_ui import launch_chunk_selector
+
+# Robust import of local sidecar module `chunkmap_ui`
+try:
+    import chunkmap_ui  # normal import (dev + most PyInstaller builds)
+except ModuleNotFoundError:
+    import importlib.util, sys, os
+    bases = [
+        getattr(sys, "_MEIPASS", ""),  # PyInstaller temp dir
+        os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else "",
+        os.path.dirname(__file__),     # project folder in dev
+        os.getcwd(),                   # current working dir
+    ]
+    candidates = []
+    for b in filter(None, bases):
+        candidates.append(os.path.join(b, "chunkmap_ui.py"))
+        candidates.append(os.path.join(b, "chunkmap_ui", "__init__.py"))
+    for path in candidates:
+        if os.path.exists(path):
+            spec = importlib.util.spec_from_file_location("chunkmap_ui", path)
+            mod = importlib.util.module_from_spec(spec)  # type: ignore
+            assert spec and spec.loader
+            spec.loader.exec_module(mod)  # type: ignore
+            sys.modules["chunkmap_ui"] = mod
+            chunkmap_ui = mod  # type: ignore  # noqa
+            break
+    else:
+        # Still not found — re-raise the original error
+        raise
+        
+# ---- expose symbols we call directly
+if not hasattr(chunkmap_ui, "launch_chunk_selector"):
+    raise ImportError("chunkmap_ui.launch_chunk_selector() is missing")
+launch_chunk_selector = chunkmap_ui.launch_chunk_selector  # convenience alias
+
 
 # ---------------- Constants / globals ----------------
 SECTOR_BYTES = 4096
@@ -1014,7 +1047,7 @@ class RulesEditorDialog:
         from tkinter import ttk, filedialog, messagebox
         self.world = world
         self.rules = rules
-               self.dims = dims
+        self.dims = dims
         self.nei_map: Dict[str,str] = nei_autoload or {}
 
         self.top = tk.Toplevel(master)
@@ -1800,3 +1833,4 @@ if __name__ == "__main__":
             pass
         print(tb, file=sys.stderr)
         sys.exit(1)
+
