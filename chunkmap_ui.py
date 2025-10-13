@@ -1587,7 +1587,7 @@ class ChunkMapWindow(tk.Toplevel):
                 for i, mca in enumerate(files, 1):
                     h = _chunks_matching_biomes(mca, wanted)
                     hits |= h
-                    self._log(f"  [{i}/{len(files)}] {mca.name}: +{len(h)} match(es)}", newline=True)
+                    self._log("  [{}/{}] {}: +{} match(es)".format(i, len(files), mca.name, len(h)), newline=True)
                 dimtag = _dim_tag(self.world, rdir)
                 if hits:
                     self.selection._push_undo(dimtag)
