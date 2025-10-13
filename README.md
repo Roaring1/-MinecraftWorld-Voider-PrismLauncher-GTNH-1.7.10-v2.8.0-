@@ -1,63 +1,17 @@
-# Minecraft World Voider (GTNH 1.7.10)
+# GTNH World Voider (1.7.x)
 
-Re-runnable tool that turns **already-generated** chunks into air (biomes kept).
-Designed for 1.7.10 Anvil worlds (classic Sections: Blocks/Data/SkyLight/BlockLight + 256-byte Biomes).
+**What it does**
 
----
+- Safely voids chunks with provider-safe biome handling:
+  - **Overworld:** keep `Level.Biomes` if present; otherwise write Plains (id=1).
+  - **Non-overworld:** preserve `Level.Biomes` if present; otherwise omit the tag to let the provider recompute.
+- Chunk selection UI (`chunkmap_ui.py`) for include/exclude by dimension.
+- Rules Editor with optional NEI Dump import.
+- “Reset Biomes” maintenance (Tools menu).
 
-## Requirements (Windows)
+**Run (dev)**
 
-* **Python 3** installed (includes Tk/tkinter GUI support).
-
----
-
-## Install
-
-Open **PowerShell** and run:
-
-```bat
-py -3 -m pip install --upgrade NBT
-```
-
----
-
-## Run — GUI (recommended)
-
-1. **Close** Minecraft/Prism/MCEdit.
-2. **Double-click** `void_rerunnable_1710_pro.py`.
-3. Click **Browse…** → select your world folder (must contain `level.dat`).
-4. Click **Scan Dims** → **Run**.
-
-> If the `NBT` package is missing, a window will tell you exactly what to install.
-
----
-
-## Run — CLI (optional)
-
-```bat
-py -3 ".\void_rerunnable_1710_pro.py" "C:\Path\To\World" --backup --workers 4 --wait-for-unlock 20
-```
-
-Common flags:
-
-* `--backup` : make a zip of the world first
-* `--workers N` : process region files in parallel
-* `--wait-for-unlock S` : wait up to S seconds for `session.lock` to clear
-* Area filters: `--bbox minX,minZ,maxX,maxZ` or `--center-x X --center-z Z --radius-blocks R`
-
----
-
-## Notes
-
-* This **voids existing chunks** only. New, unexplored chunks will still generate normally.
-* Re-run the tool any time to void **newly generated** areas.
-* If you see `session.lock`, the world is open—close the game or use `--wait-for-unlock`.
-
----
-
-## Optional: Build a one-file EXE
-
-```bat
-py -3 -m pip install pyinstaller
-pyinstaller --onefile --windowed void_rerunnable_1710_pro.py
-```
+```bash
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python main_voider.py

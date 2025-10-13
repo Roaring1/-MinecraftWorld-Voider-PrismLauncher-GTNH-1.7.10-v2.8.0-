@@ -1,15 +1,21 @@
+
+**.gitignore**
+```gitignore
 # Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
+.venv/
 
 # PyInstaller
 build/
 dist/
 *.spec
 
-# App artifacts
-*.void-backup.zip
-*.mca.bak
-*.config.json
+# Logs/temps
+build-logs/
+.build_tmp/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
