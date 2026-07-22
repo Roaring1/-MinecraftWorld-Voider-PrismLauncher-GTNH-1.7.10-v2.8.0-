@@ -180,6 +180,84 @@ class PresetAndVerificationTests(unittest.TestCase):
             self.assertTrue(any("coordinates" in error for error in report["errors"]))
 
 
+class ClientServerCompatibilityTests(unittest.TestCase):
+    def test_dedicated_server_world_and_dimensions_are_detected(self):
+        with tempfile.TemporaryDirectory() as td:
+            server = Path(td) / "server"
+            world = server / "world"
+            world.mkdir(parents=True)
+            (server / "server.properties").write_text("level-name=world\n", encoding="utf-8")
+            (world / "level.dat").write_bytes(b"test")
+            raw_overworld = mv._build_void_chunk(0, 0, bytes([1] * 256), True, None,
+                                                 False, False, None, 1)
+            raw_nether = mv._build_void_chunk(0, 0, bytes([8] * 256), True, None,
+                                              False, False, None, 0)
+            make_region(world / "region", raw_overworld)
+            make_region(world / "DIM-1" / "region", raw_nether)
+            inventory = mv.inspect_world(world)
+            self.assertEqual(inventory["kind"], "dedicated-server")
+            self.assertEqual(inventory["region_files"], 2)
+            self.assertEqual({d["tag"] for d in inventory["dimensions"]},
+                             {"region", "DIM-1/region"})
+            self.assertTrue(mv.verify_world(world)["ok"])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX lock test")
+    def test_active_server_lock_blocks_writes(self):
+        with tempfile.TemporaryDirectory() as td:
+            world = Path(td) / "world"
+            world.mkdir()
+            (world / "level.dat").write_bytes(b"test")
+            lock_path = world / "session.lock"
+            lock_path.write_bytes(b"lock")
+            holder = subprocess.Popen([
+                sys.executable, "-c",
+                "import fcntl,sys,time; f=open(sys.argv[1],'r+b'); "
+                "fcntl.lockf(f.fileno(),fcntl.LOCK_EX); print('locked',flush=True); time.sleep(10)",
+                str(lock_path),
+            ], stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), "locked")
+                status, _ = mv._world_lock_status(world)
+                self.assertEqual(status, "active")
+                with self.assertRaises(RuntimeError):
+                    mv._assert_world_not_active(world)
+            finally:
+                holder.terminate()
+                holder.wait(timeout=5)
+                if holder.stdout is not None:
+                    holder.stdout.close()
+
+
+class LinuxInstallerTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "Linux installer test")
+    def test_native_installer_creates_launcher_and_desktop_entry(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bundle = root / "bundle"
+            home = root / "home"
+            xdg = home / ".local" / "share"
+            bundle.mkdir(parents=True)
+            home.mkdir()
+            script = Path(mv.__file__).with_name("install_native_linux.sh")
+            installer = bundle / script.name
+            installer.write_bytes(script.read_bytes())
+            installer.chmod(0o755)
+            binary = bundle / "Voider-GTNH"
+            binary.write_text("#!/usr/bin/env bash\necho native-ok\n", encoding="utf-8")
+            binary.chmod(0o755)
+            (bundle / "image.png").write_bytes(b"png")
+            env = os.environ.copy()
+            env.update({"HOME": str(home), "XDG_DATA_HOME": str(xdg)})
+            proc = subprocess.run([str(installer)], env=env, text=True,
+                                  capture_output=True, check=False)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            launcher = home / ".local" / "bin" / "gtnh-world-voider"
+            desktop = xdg / "applications" / "gtnh-world-voider.desktop"
+            self.assertTrue(launcher.is_symlink())
+            self.assertTrue(os.access(launcher.resolve(), os.X_OK))
+            self.assertIn("Exec=", desktop.read_text(encoding="utf-8"))
+
+
 class SelectionAndHeadlessTests(unittest.TestCase):
     def test_selection_validation_and_exclude_wins(self):
         with tempfile.TemporaryDirectory() as td:

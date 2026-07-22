@@ -7,7 +7,11 @@ VENV="${GTNH_VOIDER_VENV:-$ROOT/.venv-linux}"
 if ! command -v "$PYTHON" >/dev/null; then
   echo "Python 3 is required." >&2; exit 2
 fi
-if ! "$PYTHON" -c 'import tkinter' >/dev/null 2>&1; then
+NEEDS_GUI=1
+for arg in "$@"; do
+  [[ "$arg" == "--headless" || "$arg" == "--verify-world" || "$arg" == "--inspect-world" ]] && NEEDS_GUI=0
+done
+if [[ "$NEEDS_GUI" == 1 ]] && ! "$PYTHON" -c 'import tkinter' >/dev/null 2>&1; then
   cat >&2 <<'EOF'
 Tkinter is missing. On Nobara/Fedora run:
   sudo dnf install python3-tkinter

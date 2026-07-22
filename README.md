@@ -1,4 +1,4 @@
-# GTNH World Voider 2.0.0
+# GTNH World Voider 2.1.0
 
 A safety-first chunk voiding and biome-maintenance tool for Minecraft 1.7.x worlds, especially GregTech: New Horizons 2.8.x instances managed by Prism Launcher.
 
@@ -11,7 +11,7 @@ A safety-first chunk voiding and biome-maintenance tool for Minecraft 1.7.x worl
 - Headless mode refuses an implicit whole-world operation: provide a selection or `--all-chunks`.
 - Selection JSON is schema- and type-validated.
 
-Always close Minecraft before writing. `session.lock` normally remains after shutdown, so its presence alone is not a reliable activity signal.
+Always close Minecraft or stop the dedicated server before writing. The tool now tests the operating-system lock behind `session.lock` and refuses writes when another process holds it. A stale, unlocked file does not block use.
 
 ## Features
 
@@ -44,6 +44,18 @@ chmod +x install_linux.sh
 ```
 
 This installs a desktop entry and `~/.local/bin/gtnh-world-voider`.
+
+Run the Nobara/Fedora diagnostic afterward:
+
+```bash
+~/.local/share/gtnh-world-voider/doctor_linux.sh
+```
+
+The native Linux release bundle needs no Python installation. Extract it and run:
+
+```bash
+./install_native_linux.sh
+```
 
 ### Build native Linux bundles
 
@@ -95,6 +107,18 @@ python3 main_voider.py '/path/to/world' --headless --all-chunks --only DIM-1/reg
 
 The default selection path is `<world>/.voider-selection.json` when present.
 
+## Client and dedicated-server worlds
+
+Both client saves and dedicated-server worlds use the same Minecraft 1.7 Anvil region format and are supported. Select the directory containing `level.dat`—for a typical server this is `server/world`, not necessarily the directory containing the server JAR.
+
+The tool discovers and processes the Overworld `region/` directory and nested dimensions such as `DIM-1/region`, `DIM1/region`, and modded dimension folders. Inspect a world without changing it:
+
+```bash
+gtnh-world-voider '/path/to/server/world' --inspect-world --report inventory.json
+```
+
+Stop the server cleanly before any write. The operating-system `session.lock` check, verified backup, concurrent-file signature check, atomic region replacement, and post-write verifier all apply to server worlds.
+
 ## Read-only verification
 
 ```bash
@@ -127,7 +151,7 @@ python3 -m venv .venv-test
 PYTHON=.venv-test/bin/python ./test.sh
 ```
 
-The regression suite creates synthetic real-NBT Anvil regions and tests parsing, platform encoding, rules, atomic replacement, backups, and malformed selections.
+The regression suite creates synthetic real-NBT Anvil regions and tests client/server layouts, live server locks, native Linux installation, parsing, platform encoding, rules, atomic replacement, backups, verification, and malformed selections.
 
 ## Release
 

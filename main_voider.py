@@ -319,6 +319,76 @@ def _find_region_dirs(world:Path) -> List[Path]:
 def _dim_tag(world:Path, region_dir:Path) -> str:
     return str(region_dir.relative_to(world)).replace("\\","/")
 
+def _world_kind(world:Path) -> str:
+    """Classify a selected save without changing how its Anvil data is read."""
+    if (world/"server.properties").is_file() or (world.parent/"server.properties").is_file():
+        return "dedicated-server"
+    parts = {part.lower() for part in world.parts}
+    if "saves" in parts or any("prismlauncher" in part for part in parts):
+        return "client-save"
+    return "minecraft-world"
+
+def _world_lock_status(world:Path) -> Tuple[str, str]:
+    """Best-effort detection of an OS-held Minecraft session.lock."""
+    lock_path = world/"session.lock"
+    if not lock_path.exists():
+        return "unlocked", "session.lock is absent"
+    try:
+        if os.name == "posix":
+            import fcntl
+            with lock_path.open("a+b") as fp:
+                try:
+                    fcntl.lockf(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB, 1)
+                except (BlockingIOError, PermissionError):
+                    return "active", "session.lock is held by another process"
+                finally:
+                    try: fcntl.lockf(fp.fileno(), fcntl.LOCK_UN, 1)
+                    except OSError: pass
+            return "unlocked", "session.lock exists but is not OS-locked"
+        if os.name == "nt":
+            import msvcrt
+            with lock_path.open("a+b") as fp:
+                if fp.tell() == 0: fp.write(b"\0"); fp.flush()
+                fp.seek(0)
+                try:
+                    msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)
+                except OSError:
+                    return "active", "session.lock is held by another process"
+                finally:
+                    try: fp.seek(0); msvcrt.locking(fp.fileno(), msvcrt.LK_UNLCK, 1)
+                    except OSError: pass
+            return "unlocked", "session.lock exists but is not OS-locked"
+    except OSError as exc:
+        return "unknown", f"could not test session.lock: {exc}"
+    return "unknown", "OS lock testing is unavailable on this platform"
+
+def inspect_world(world:Path) -> Dict[str, object]:
+    """Return a read-only client/server world inventory."""
+    status, detail = _world_lock_status(world)
+    dimensions=[]
+    total_files=0; total_bytes=0
+    for rdir in _find_region_dirs(world):
+        files=sorted(rdir.glob("r.*.*.mca"))
+        size=sum(p.stat().st_size for p in files)
+        dimensions.append({"tag": _dim_tag(world, rdir), "region_files": len(files), "bytes": size})
+        total_files += len(files); total_bytes += size
+    return {"world": str(world), "kind": _world_kind(world),
+            "lock_status": status, "lock_detail": detail,
+            "dimensions": dimensions, "region_files": total_files,
+            "region_bytes": total_bytes}
+
+def _assert_world_not_active(world:Path) -> None:
+    status, detail = _world_lock_status(world)
+    if status == "active":
+        raise RuntimeError(
+            f"World appears to be open by Minecraft or a server ({detail}). "
+            "Stop it cleanly before writing."
+        )
+    if status == "unknown":
+        print(f"[warning] World activity could not be confirmed: {detail}", file=sys.stderr)
+    else:
+        print(f"World lock check: {detail}")
+
 # ---------------- Biomes / flags ----------------
 def _nbt_from_raw(raw:bytes) -> Optional[nbt.NBTFile]:
     try:
@@ -1932,6 +2002,9 @@ def run_voider(world:Path,
 
     total_scanned=0; total_changed=0
 
+    if not args.dry_run:
+        _assert_world_not_active(world)
+
     if args.backup and not args.dry_run:
         if status_cb: status_cb("Creating world ZIP backup…")
         before_backup=_region_snapshot(world)
@@ -2063,6 +2136,8 @@ def main()->bool:
                     help="Explicitly process all chunks after other filters (headless safety gate)")
     ap.add_argument("--verify-world", action="store_true",
                     help="Read-only audit of region sectors, NBT, and coordinates")
+    ap.add_argument("--inspect-world", action="store_true",
+                    help="Read-only client/server world inventory and lock status")
     ap.add_argument("--report", type=str, help="Write a JSON verification/run report")
     verify_group=ap.add_mutually_exclusive_group()
     verify_group.add_argument("--post-verify", dest="post_verify", action="store_true", default=True,
@@ -2072,6 +2147,15 @@ def main()->bool:
 
     args=ap.parse_args()
     _apply_preset(args)
+
+    if args.inspect_world:
+        if not args.world: ap.error("--inspect-world requires a world path")
+        world=Path(args.world).expanduser().resolve()
+        if not (world/"level.dat").is_file(): ap.error(f"level.dat not found under {world}")
+        rendered=json.dumps(inspect_world(world), indent=2)
+        print(rendered)
+        if args.report: Path(args.report).expanduser().write_text(rendered+"\n", encoding="utf-8")
+        return True
 
     if args.verify_world:
         if not args.world: ap.error("--verify-world requires a world path")

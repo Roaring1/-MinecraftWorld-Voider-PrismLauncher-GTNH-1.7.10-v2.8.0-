@@ -1,4 +1,4 @@
-# Publish 2.0.0 to GitHub
+# Publish 2.1.0 to GitHub
 
 Run these commands later from a clean clone of the repository. They do not expose tokens in shell history; authenticate with `gh auth login` if needed.
 
@@ -14,7 +14,7 @@ git pull --ff-only origin main
 Copy the delivered `code/` contents into the clone, then:
 
 ```bash
-chmod +x run_voider.sh install_linux.sh uninstall_linux.sh build_linux.sh test.sh prepare_release.sh
+chmod +x run_voider.sh install_linux.sh install_native_linux.sh uninstall_linux.sh doctor_linux.sh build_linux.sh test.sh prepare_release.sh
 git diff --check
 git status --short
 ```
@@ -26,7 +26,7 @@ python3 -m venv .venv-release
 .venv-release/bin/python -m pip install -r requirements-runtime.txt
 PYTHON=.venv-release/bin/python ./test.sh
 PYTHON=.venv-release/bin/python ./prepare_release.sh
-cat release-out/v2.0.0/SHA256SUMS.txt
+cat release-out/v2.1.0/SHA256SUMS.txt
 ```
 
 On Nobara, install Tk first if you also want GUI/build validation:
@@ -40,15 +40,15 @@ sudo dnf install python3-tkinter rsync desktop-file-utils binutils
 
 ```bash
 git add --all
-git commit -m "release: GTNH World Voider 2.0.0"
+git commit -m "release: GTNH World Voider 2.1.0"
 git push origin main
 ```
 
 ## 4. Tag the exact pushed commit
 
 ```bash
-git tag -a v2.0.0 -m "GTNH World Voider 2.0.0"
-git push origin v2.0.0
+git tag -a v2.1.0 -m "GTNH World Voider 2.1.0"
+git push origin v2.1.0
 ```
 
 The tag starts the GitHub release workflow. Wait for it to finish:
@@ -63,23 +63,23 @@ gh run watch
 If the workflow has not created the release:
 
 ```bash
-gh release create v2.0.0 \
+gh release create v2.1.0 \
   --repo Roaring1/-MinecraftWorld-Voider-PrismLauncher-GTNH-1.7.10-v2.8.0- \
-  --title "GTNH World Voider 2.0.0" \
+  --title "GTNH World Voider 2.1.0" \
   --notes-file CHANGELOG.md \
   --latest \
-  release-out/v2.0.0/*
+  release-out/v2.1.0/*
 ```
 
-If `v2.0.0` already exists, upload/replace local source artifacts and mark it Latest:
+If `v2.1.0` already exists, upload/replace local source artifacts and mark it Latest:
 
 ```bash
-gh release upload v2.0.0 \
+gh release upload v2.1.0 \
   --repo Roaring1/-MinecraftWorld-Voider-PrismLauncher-GTNH-1.7.10-v2.8.0- \
-  --clobber release-out/v2.0.0/*
-gh release edit v2.0.0 \
+  --clobber release-out/v2.1.0/*
+gh release edit v2.1.0 \
   --repo Roaring1/-MinecraftWorld-Voider-PrismLauncher-GTNH-1.7.10-v2.8.0- \
-  --title "GTNH World Voider 2.0.0" \
+  --title "GTNH World Voider 2.1.0" \
   --notes-file CHANGELOG.md \
   --latest
 ```
@@ -87,10 +87,10 @@ gh release edit v2.0.0 \
 ## 6. Verify what users will download
 
 ```bash
-gh release view v2.0.0 \
+gh release view v2.1.0 \
   --repo Roaring1/-MinecraftWorld-Voider-PrismLauncher-GTNH-1.7.10-v2.8.0- \
   --json url,isLatest,name,tagName,assets
-gh release download v2.0.0 --dir /tmp/gtnh-voider-release-check
+gh release download v2.1.0 --dir /tmp/gtnh-voider-release-check
 (cd /tmp/gtnh-voider-release-check && sha256sum -c SHA256SUMS.txt)
 ```
 

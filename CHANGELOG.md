@@ -1,18 +1,21 @@
 # Changelog
 
-## 2.1.0 — in progress
-
-_Development for the next release. Nothing below is published yet._
+## 2.1.0 — 2026-07-21
 
 ### Added
 - Named `manual`, `safe-void`, `full-void`, and `preserve-data` processing presets in the CLI and GUI.
 - GUI write runs now perform a full dry-run preflight and show the exact candidate chunk count before confirmation.
 - Post-write region verification is enabled by default and checks sector allocation, overlap, NBT readability, and chunk coordinates.
 - Headless JSON reports include the selected preset and complete post-write verification result.
+- Added read-only `--inspect-world` inventory with client/server classification, dimensions, region size, and lock status.
+- Added operating-system `session.lock` detection and refusal to write while a client or dedicated server holds the world open.
+- Added a native Linux installer and a Nobara/Fedora diagnostic script.
 
 ### Maintenance
-- Added regression coverage for presets and valid/invalid world verification.
+- Added regression coverage for presets, valid/invalid world verification, dedicated-server dimension layouts, held server locks, and native Linux installation.
 - Removed safe unused imports, a bare exception, and other correctness-oriented lint findings without reformatting legacy code wholesale.
+- Fixed the Linux release workflow to build with Ubuntu's matched Python/Tk packages instead of a Tk-less setup-python interpreter.
+- Added strict release artifact existence checks and a self-contained native Linux bundle.
 
 ## 2.0.0 — r12 hardening release
 

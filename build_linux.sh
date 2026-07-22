@@ -21,6 +21,16 @@ mv dist/Voider-GTNH dist/Voider-GTNH-linux-onedir
 (
   cd dist
   tar -czf Voider-GTNH-linux-x86_64-onedir.tar.gz Voider-GTNH-linux-onedir
-  sha256sum Voider-GTNH Voider-GTNH-linux-x86_64-onedir.tar.gz > SHA256SUMS-linux.txt
+)
+PORTABLE="dist/GTNH-World-Voider-linux-x86_64"
+rm -rf "$PORTABLE"
+mkdir -p "$PORTABLE"
+cp dist/Voider-GTNH "$PORTABLE/Voider-GTNH"
+cp install_native_linux.sh uninstall_linux.sh image.png README.md LICENSE VERSION "$PORTABLE/"
+chmod +x "$PORTABLE/Voider-GTNH" "$PORTABLE/install_native_linux.sh" "$PORTABLE/uninstall_linux.sh"
+(
+  cd dist
+  tar -czf GTNH-World-Voider-linux-x86_64.tar.gz GTNH-World-Voider-linux-x86_64
+  sha256sum Voider-GTNH Voider-GTNH-linux-x86_64-onedir.tar.gz GTNH-World-Voider-linux-x86_64.tar.gz > SHA256SUMS-linux.txt
 )
 echo "Linux artifacts are in $ROOT/dist"

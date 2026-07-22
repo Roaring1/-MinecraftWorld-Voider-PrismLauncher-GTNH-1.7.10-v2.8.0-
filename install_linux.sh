@@ -11,7 +11,7 @@ if ! python3 -c 'import tkinter' >/dev/null 2>&1; then
 fi
 mkdir -p "$APP_HOME" "$APP_DIR" "$BIN_DIR"
 rsync -a --delete \
-  --exclude '.git' --exclude '.venv*' --exclude 'build' --exclude 'dist' \
+  --exclude '.git' --exclude '.venv*' --exclude 'build' --exclude 'dist' --exclude 'release-out' \
   "$SRC/" "$APP_HOME/"
 python3 -m venv "$APP_HOME/.venv-linux"
 "$APP_HOME/.venv-linux/bin/python" -m pip install --upgrade pip
@@ -29,6 +29,9 @@ Categories=Game;Utility;
 StartupNotify=true
 EOF
 chmod +x "$APP_HOME/run_voider.sh" "$BIN_DIR/gtnh-world-voider"
+chmod +x "$APP_HOME/doctor_linux.sh" "$APP_HOME/uninstall_linux.sh" "$APP_HOME/install_native_linux.sh"
 command -v update-desktop-database >/dev/null && update-desktop-database "$APP_DIR" || true
+PYTHONPATH="$APP_HOME" "$APP_HOME/.venv-linux/bin/python" -c 'import main_voider; print("Application self-test: PASS")'
 echo "Installed GTNH World Voider to $APP_HOME"
 echo "CLI launcher: $BIN_DIR/gtnh-world-voider"
+echo "Diagnostics: $APP_HOME/doctor_linux.sh"
