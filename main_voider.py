@@ -7,7 +7,19 @@
 # - Fixes prior duplicate defs; same UI/CLI surface as r10 (+ one new flag and one GUI checkbox)
 
 from __future__ import annotations
-import os, sys, io, time, json, struct, zlib, argparse, threading, queue, hashlib, shutil
+import os
+import sys
+import io
+import time
+import json
+import struct
+import zlib
+import argparse
+import threading
+import queue
+import hashlib
+import shutil
+import copy
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from zipfile import ZipFile, ZIP_DEFLATED
@@ -80,6 +92,32 @@ class AllRules:
 
 _GLOBAL_RULES: AllRules = AllRules()
 
+PRESETS = {
+    "manual": {},
+    "safe-void": {
+        "skip_if_entities": True, "skip_if_tileentities": True,
+        "keep_entities": False, "keep_tileentities": False, "mark_void": True,
+    },
+    "full-void": {
+        "skip_if_entities": False, "skip_if_tileentities": False,
+        "keep_entities": False, "keep_tileentities": False, "mark_void": True,
+    },
+    "preserve-data": {
+        "skip_if_entities": False, "skip_if_tileentities": False,
+        "keep_entities": True, "keep_tileentities": True, "mark_void": True,
+    },
+}
+
+def _apply_preset(args) -> None:
+    """Apply a named, reviewable bundle of existing processing options."""
+    name = getattr(args, "preset", "manual")
+    try:
+        values = PRESETS[name]
+    except KeyError as exc:
+        raise ValueError(f"unknown preset {name!r}") from exc
+    for key, value in values.items():
+        setattr(args, key, value)
+
 # ---------------- Region I/O ----------------
 def _read_header(fp):
     fp.seek(0)
@@ -136,7 +174,9 @@ def _scan_and_decode(data: bytes) -> Optional[bytes]:
     Brute-force scan of the whole sector window for gzip/zlib/raw-deflate, then
     a last-chance check for already-uncompressed NBT. Slow but robust.
     """
-    import gzip, zlib, io
+    import gzip
+    import zlib
+    import io
     from nbt import nbt
 
     # 1) Any gzip stream anywhere
@@ -1146,7 +1186,6 @@ class _TeeIO:
 class Tooltip:
     _shift_down=False
     def __init__(self, widget, short:str, extended:str=""):
-        import tkinter as tk
         self.widget=widget; self.short=short; self.ext=extended or short
         self.tip=None
         widget.bind("<Enter>", self._enter)
@@ -1235,7 +1274,7 @@ class HelpDialog:
 class RulesEditorDialog:
     def __init__(self, master, world: Path, rules: AllRules, dims: List[str], nei_autoload: Optional[Dict[str,str]]):
         import tkinter as tk
-        from tkinter import ttk, filedialog, messagebox
+        from tkinter import ttk
         self.world = world
         self.rules = rules
         self.dims = dims
@@ -1383,7 +1422,7 @@ class RulesEditorDialog:
             out=[]
             for s in get_lines(txt):
                 try: out.append(int(s))
-                except: pass
+                except ValueError: pass
             return out
         rs.biome_whitelist = ints(self.biome_whitelist_txt)
         rs.biome_blacklist = ints(self.biome_blacklist_txt)
@@ -1397,7 +1436,7 @@ class RulesEditorDialog:
 class VoiderStatusUI:
     def __init__(self, args):
         import tkinter as tk
-        from tkinter import ttk, messagebox, filedialog
+        from tkinter import ttk
         import tkinter.font as tkfont
 
         self.args = args
@@ -1443,6 +1482,11 @@ class VoiderStatusUI:
                 "Mark Include/Exclude chunk coords per dimension; results saved in .voider-selection.json.")
 
         opts = ttk.Frame(self.tk); opts.pack(fill="x", padx=10, pady=(0,8))
+        self.preset = tk.StringVar(value=getattr(args, "preset", "manual"))
+        ttk.Label(opts, text="Preset:").pack(side="left", padx=(0,4))
+        self.preset_box = ttk.Combobox(opts, textvariable=self.preset, state="readonly", width=14,
+                                       values=tuple(PRESETS))
+        self.preset_box.pack(side="left", padx=(0,10))
         self.dry = tk.BooleanVar(value=bool(args.dry_run))
         self.include_void = tk.BooleanVar(value=bool(args.include_void))
         self.keep_entities = tk.BooleanVar(value=bool(args.keep_entities))
@@ -1452,6 +1496,7 @@ class VoiderStatusUI:
         self.mark_void = tk.BooleanVar(value=bool(args.mark_void))
         self.restore_biomes = tk.BooleanVar(value=bool(args.restore_biomes))
         self.nether_placeholder = tk.BooleanVar(value=bool(args.nether_cosmetic_placeholder))
+        self.post_verify = tk.BooleanVar(value=bool(getattr(args, "post_verify", True)))
         self.workers = tk.IntVar(value=int(args.workers or 1))
         def add_chk(text, var, short, ext):
             b = ttk.Checkbutton(opts, text=text, variable=var); b.pack(side="left", padx=(0,10)); Tooltip(b, short, ext)
@@ -1474,6 +1519,8 @@ class VoiderStatusUI:
                 "When rewriting chunks, if Biomes are absent and a .bak exists, copy from the .bak.")
         add_chk("Nether placeholder", self.nether_placeholder, "Cosmetic Hell biomes in DIM-1 when missing.",
                 "When enabled, missing Nether biomes are temporarily written as Hell (id=8) to avoid 'Ocean' HUD; repop flags are still cleared so providers may overwrite.")
+        add_chk("Verify after write", self.post_verify, "Audit the world after modifications.",
+                "Checks sector ranges, overlap, NBT readability, and stored chunk coordinates after every write run.")
         wlbl = ttk.Label(opts, text="Workers:"); wlbl.pack(side="left", padx=(10,4))
         self.worker_spin = ttk.Spinbox(opts, from_=1, to=32, width=4, textvariable=self.workers)
         self.worker_spin.pack(side="left")
@@ -1632,7 +1679,7 @@ class VoiderStatusUI:
 
     def _open_selector(self):
         try:
-            sel = launch_chunk_selector(
+            launch_chunk_selector(
                 self.world_var.get(),
                 initial_dim=self.args.initial_dim,
                 preload=None,
@@ -1661,6 +1708,9 @@ class VoiderStatusUI:
         self.args.workers = int(self.workers.get())
         self.args.restore_biomes = self.restore_biomes.get()
         self.args.nether_cosmetic_placeholder = self.nether_placeholder.get()
+        self.args.post_verify = self.post_verify.get()
+        self.args.preset = self.preset.get()
+        _apply_preset(self.args)
 
         self.cancel_event.clear()
         self.btn_start.configure(state="disabled")
@@ -1689,11 +1739,41 @@ class VoiderStatusUI:
                         pct=int((done/total)*100) if total else 0
                     self._set_progress(pct); self._set_status(f"{pct}% — {line}")
 
+                if not self.args.dry_run:
+                    preview_args = copy.copy(self.args)
+                    preview_args.dry_run = True
+                    preview_args.backup = False
+                    preview_scanned, preview_changed = run_voider(
+                        world, sel_include, sel_exclude, preview_args,
+                        progress_cb=prog_cb, status_cb=self._set_status, rules=rules_local,
+                        cancel_event=self.cancel_event,
+                    )
+                    if self.cancel_event.is_set():
+                        print("Cancelled during preflight preview.")
+                        return
+                    approved = self._ask_yes_no(
+                        "Confirm world modification",
+                        f"Preflight scanned {preview_scanned} chunks and would modify "
+                        f"{preview_changed}.\n\nA verified backup will be made first. Continue?",
+                    )
+                    if not approved:
+                        print("Write cancelled after preflight preview.")
+                        self._set_status("Write cancelled.")
+                        return
+
                 total_scanned, total_changed = run_voider(
                     world, sel_include, sel_exclude, self.args,
                     progress_cb=prog_cb, status_cb=self._set_status, rules=rules_local,
                     cancel_event=self.cancel_event,
                 )
+                if not self.args.dry_run and total_changed and self.args.post_verify:
+                    self._set_status("Verifying written world…")
+                    audit = verify_world(world)
+                    audit_path = world/".voider-last-verification.json"
+                    audit_path.write_text(json.dumps(audit, indent=2)+"\n", encoding="utf-8")
+                    if not audit["ok"]:
+                        raise RuntimeError(f"Post-write verification found {len(audit['errors'])} error(s); see {audit_path}")
+                    print(f"Post-write verification passed; report: {audit_path}")
                 msg = (f"Would void {total_changed} chunk(s) out of {total_scanned} scanned. Biomes provider-safe."
                        if self.args.dry_run else
                        f"Done. Voided {total_changed} chunk(s) out of {total_scanned} scanned. Biomes provider-safe.")
@@ -1712,6 +1792,20 @@ class VoiderStatusUI:
             callback()
         else:
             self.tk.after(0, callback)
+
+    def _ask_yes_no(self, title:str, message:str)->bool:
+        """Synchronously ask from a worker while creating widgets on Tk's thread."""
+        from tkinter import messagebox
+        done = threading.Event()
+        answer = {"value": False}
+        def ask():
+            try:
+                answer["value"] = bool(messagebox.askyesno(title, message, parent=self.tk))
+            finally:
+                done.set()
+        self.tk.after(0, ask)
+        done.wait()
+        return answer["value"]
 
     def _set_status(self, s:str)->None:
         self._ui_call(lambda: self.status_var.set(s))
@@ -1758,7 +1852,7 @@ class VoiderStatusUI:
 def choose_world_gui(discovered:Dict[str,str]) -> Optional[str]:
     try:
         import tkinter as tk
-        from tkinter import ttk, filedialog, messagebox
+        from tkinter import ttk
         import tkinter.font as tkfont
     except Exception:
         return None
@@ -1948,6 +2042,8 @@ def main()->bool:
     ap.add_argument("--keep-entities", action="store_true", help="Preserve Entities (copy through)")
     ap.add_argument("--keep-tileentities", action="store_true", help="Preserve TileEntities (copy through)")
     ap.add_argument("--mark-void", action="store_true", help="Mark voided chunks with a Voider tag")
+    ap.add_argument("--preset", choices=tuple(PRESETS), default="manual",
+                    help="Named option bundle: safe-void, full-void, preserve-data, or manual")
     ap.add_argument("--force-rescan", action="store_true", help="Force re-scan of drives for worlds (ignore cache)")
 
     # Maintenance / behavior flags
@@ -1968,8 +2064,14 @@ def main()->bool:
     ap.add_argument("--verify-world", action="store_true",
                     help="Read-only audit of region sectors, NBT, and coordinates")
     ap.add_argument("--report", type=str, help="Write a JSON verification/run report")
+    verify_group=ap.add_mutually_exclusive_group()
+    verify_group.add_argument("--post-verify", dest="post_verify", action="store_true", default=True,
+                              help="Verify region integrity after writes (default)")
+    verify_group.add_argument("--no-post-verify", dest="post_verify", action="store_false",
+                              help="Skip post-write verification")
 
     args=ap.parse_args()
+    _apply_preset(args)
 
     if args.verify_world:
         if not args.world: ap.error("--verify-world requires a world path")
@@ -2002,13 +2104,19 @@ def main()->bool:
         scanned, changed=run_voider(world, sel_include, sel_exclude, args, rules=rules)
         verb="Would void" if args.dry_run else "Voided"
         print(f"{verb} {changed} chunk(s) out of {scanned} scanned.")
+        audit = None
+        if not args.dry_run and changed and args.post_verify:
+            audit = verify_world(world)
+            if not audit["ok"]:
+                print(f"ERROR: post-write verification found {len(audit['errors'])} error(s).", file=sys.stderr)
         if args.report:
             result={"world": str(world), "mode": "dry-run" if args.dry_run else "write",
                     "scanned_chunks": scanned, "changed_chunks": changed,
                     "selection": str(selection_path) if selection_path.exists() else None,
-                    "all_chunks": bool(args.all_chunks), "backup_enabled": bool(args.backup)}
+                    "all_chunks": bool(args.all_chunks), "backup_enabled": bool(args.backup),
+                    "preset": args.preset, "post_write_verification": audit}
             Path(args.report).expanduser().write_text(json.dumps(result, indent=2)+"\n", encoding="utf-8")
-        return True
+        return audit is None or bool(audit["ok"])
 
     if args.reset_biomes_dims:
         world_path: Optional[str] = args.world

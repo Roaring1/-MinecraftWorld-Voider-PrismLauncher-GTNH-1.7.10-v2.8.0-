@@ -103,6 +103,22 @@ python3 main_voider.py '/path/to/world' --verify-world --report world-audit.json
 
 This checks sector ranges and overlap, NBT readability, and stored chunk coordinates without opening Tk or modifying the world.
 
+## Named presets and write verification
+
+Use `--preset` to apply a reviewed group of processing options:
+
+- `safe-void`: skip chunks containing entities or tile entities, and mark rewritten chunks.
+- `full-void`: void eligible chunks even when they contain entities or tile entities.
+- `preserve-data`: preserve entity and tile-entity lists while voiding terrain.
+- `manual`: use individual flags exactly as supplied (default).
+
+```bash
+python3 main_voider.py '/path/to/world' --headless --all-chunks \
+  --preset safe-void --dry-run --report preview.json
+```
+
+GUI write runs always perform a dry-run preflight and ask for confirmation with the candidate count. After a write, the world verifier runs automatically. Headless users can disable only the latter with `--no-post-verify`; doing so is not recommended.
+
 ## Tests
 
 ```bash

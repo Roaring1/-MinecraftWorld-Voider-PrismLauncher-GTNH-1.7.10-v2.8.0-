@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.1.0 — in progress
+
+_Development for the next release. Nothing below is published yet._
+
+### Added
+- Named `manual`, `safe-void`, `full-void`, and `preserve-data` processing presets in the CLI and GUI.
+- GUI write runs now perform a full dry-run preflight and show the exact candidate chunk count before confirmation.
+- Post-write region verification is enabled by default and checks sector allocation, overlap, NBT readability, and chunk coordinates.
+- Headless JSON reports include the selected preset and complete post-write verification result.
+
+### Maintenance
+- Added regression coverage for presets and valid/invalid world verification.
+- Removed safe unused imports, a bare exception, and other correctness-oriented lint findings without reformatting legacy code wholesale.
+
 ## 2.0.0 — r12 hardening release
 
 ### Correctness

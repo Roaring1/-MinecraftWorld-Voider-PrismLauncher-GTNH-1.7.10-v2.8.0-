@@ -10,7 +10,16 @@
 #   pip install Pillow NBT
 
 from __future__ import annotations
-import os, sys, math, json, time, glob, struct, string, traceback, threading
+import os
+import sys
+import math
+import json
+import time
+import glob
+import struct
+import string
+import traceback
+import threading
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set
 from collections import deque
@@ -1535,7 +1544,7 @@ class ChunkMapWindow(tk.Toplevel):
             return
         ok = messagebox.askyesno("Reset Biomes",
                                  "This will remove Level.Biomes from selected dimensions so providers recompute on next load.\n\n"
-                                 f"Dimensions:\n  - " + "\n  - ".join(tags) + "\n\nProceed?")
+                                 "Dimensions:\n  - " + "\n  - ".join(tags) + "\n\nProceed?")
         if not ok: return
         self._log("Starting Reset Biomes…")
         def worker():

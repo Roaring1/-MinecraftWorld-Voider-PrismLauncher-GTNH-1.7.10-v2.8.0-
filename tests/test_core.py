@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from argparse import Namespace
 from pathlib import Path
 
 import main_voider as mv
@@ -140,6 +141,45 @@ class BackupTests(unittest.TestCase):
                     self.assertIn("level.dat", zf.namelist())
 
 
+class PresetAndVerificationTests(unittest.TestCase):
+    def test_safe_void_preset(self):
+        args = Namespace(
+            preset="safe-void", skip_if_entities=False,
+            skip_if_tileentities=False, keep_entities=True,
+            keep_tileentities=True, mark_void=False,
+        )
+        mv._apply_preset(args)
+        self.assertTrue(args.skip_if_entities)
+        self.assertTrue(args.skip_if_tileentities)
+        self.assertFalse(args.keep_entities)
+        self.assertFalse(args.keep_tileentities)
+        self.assertTrue(args.mark_void)
+
+    def test_world_verifier_accepts_valid_region(self):
+        with tempfile.TemporaryDirectory() as td:
+            world = Path(td) / "World"
+            world.mkdir()
+            (world / "level.dat").write_bytes(b"test")
+            raw = mv._build_void_chunk(0, 0, bytes([1] * 256), True, None,
+                                       False, False, None, 1)
+            make_region(world / "region", raw)
+            report = mv.verify_world(world)
+            self.assertTrue(report["ok"], report["errors"])
+            self.assertEqual(report["valid_chunks"], 1)
+
+    def test_world_verifier_rejects_wrong_coordinates(self):
+        with tempfile.TemporaryDirectory() as td:
+            world = Path(td) / "World"
+            world.mkdir()
+            (world / "level.dat").write_bytes(b"test")
+            raw = mv._build_void_chunk(9, 9, bytes([1] * 256), True, None,
+                                       False, False, None, 1)
+            make_region(world / "region", raw)
+            report = mv.verify_world(world)
+            self.assertFalse(report["ok"])
+            self.assertTrue(any("coordinates" in error for error in report["errors"]))
+
+
 class SelectionAndHeadlessTests(unittest.TestCase):
     def test_selection_validation_and_exclude_wins(self):
         with tempfile.TemporaryDirectory() as td:
@@ -174,6 +214,27 @@ class SelectionAndHeadlessTests(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("Would void 1 chunk(s)", proc.stdout)
+
+    def test_headless_write_runs_post_verifier_and_report(self):
+        with tempfile.TemporaryDirectory() as td:
+            world = Path(td) / "World"
+            region_dir = world / "region"
+            world.mkdir()
+            (world / "level.dat").write_bytes(b"test")
+            raw = mv._build_void_chunk(0, 0, bytes([1] * 256), True, None,
+                                       False, False, None, 1)
+            make_region(region_dir, raw)
+            report_path = Path(td) / "run-report.json"
+            proc = subprocess.run(
+                [sys.executable, str(Path(mv.__file__)), str(world), "--headless",
+                 "--all-chunks", "--include-void", "--write", "--preset",
+                 "safe-void", "--report", str(report_path)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["preset"], "safe-void")
+            self.assertTrue(report["post_write_verification"]["ok"])
 
 
 if __name__ == "__main__":
