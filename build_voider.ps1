@@ -102,8 +102,10 @@ if (-not (Test-Path -LiteralPath $PyExe)) {
 
 Write-Section "Installing/Updating dependencies"
 & $PyExe -m pip install --upgrade pip setuptools wheel | Out-Null
-if (Test-Path -LiteralPath 'requirements.txt') {
-  & $PyExe -m pip install -r requirements.txt | Out-Null
+if (Test-Path -LiteralPath 'requirements-build.txt') {
+  & $PyExe -m pip install -r requirements-build.txt | Out-Null
+} elseif (Test-Path -LiteralPath 'requirements.txt') {
+  & $PyExe -m pip install -r requirements.txt "PyInstaller>=6.6,<7" | Out-Null
 } else {
   & $PyExe -m pip install "PyInstaller>=6.6" "Pillow>=10.3" "NBT==1.5.1" | Out-Null
 }

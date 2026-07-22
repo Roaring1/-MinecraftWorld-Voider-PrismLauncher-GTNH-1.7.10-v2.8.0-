@@ -27,12 +27,14 @@ except Exception as _pil_e:
         "Pillow (PIL) is required for chunkmap_ui.\nInstall with: pip install Pillow\n\nDetails: %r" % (_pil_e,)
     )
 
-# --- Optional imports from main_voider (for Tools/Rules menu). Degrade gracefully if missing.
-try:
-    import main_voider as _mv  # sibling module
-    _HAS_MAIN = True
-except Exception:
-    _HAS_MAIN = False
+# Resolve main_voider lazily. Importing it here creates a cycle when
+# main_voider is the application entry point and imports this module.
+def _get_main_module():
+    import importlib
+    main = sys.modules.get("__main__")
+    if main is not None and hasattr(main, "reset_biomes") and hasattr(main, "RulesEditorDialog"):
+        return main
+    return importlib.import_module("main_voider")
 
 # ---------- Help / texts ----------
 HELP_LONG = (
@@ -54,7 +56,7 @@ HELP_LONG = (
     " • Imagery is skipped when too zoomed out for speed.\n\n"
     "Undo/Redo: Ctrl+Z / Ctrl+Y.  Save: Ctrl+S.\n\n"
     "Session Safety:\n"
-    " • If session.lock exists under the world, Minecraft is probably open. Don’t modify the world until it's closed.\n\n"
+    " • Close Minecraft before writing. session.lock normally persists after shutdown, so its presence alone is not proof the game is open.\n\n"
     "Tools menu:\n"
     " • Reset Biomes (All / Non-Overworld) — provider-safe policy: Overworld missing biomes → Plains (ID=1),\n"
     "   other dims → remove Biomes so the provider recomputes.\n"
@@ -602,7 +604,7 @@ class JMTileSource:
 def _get_chunk_biomes(raw: bytes) -> Optional[bytes]:
     try:
         from nbt import nbt
-        nb = nbt.NBTFile(fileobj=__import__("io").BytesIO(raw))
+        nb = nbt.NBTFile(buffer=__import__("io").BytesIO(raw))
         lvl = nb["Level"]
         if "Biomes" in lvl and isinstance(lvl["Biomes"], nbt.TAG_Byte_Array):
             b = bytes(lvl["Biomes"].value)
@@ -1492,10 +1494,8 @@ class ChunkMapWindow(tk.Toplevel):
             self.current_canvas._request_redraw()
 
     def _open_rules_editor(self):
-        if not _HAS_MAIN:
-            messagebox.showwarning("Not available", "main_voider.py not found or import failed.")
-            return
         try:
+            _mv = _get_main_module()
             if hasattr(_mv, "RulesEditorDialog"):
                 dims = [_mv._dim_tag(self.world, d) for d in _mv._find_region_dirs(self.world)]
                 if hasattr(_mv, "_load_rules"):
@@ -1514,7 +1514,12 @@ class ChunkMapWindow(tk.Toplevel):
         self._reset_biomes(dims="non_overworld")
 
     def _reset_biomes(self, dims:str):
-        if not _HAS_MAIN or not hasattr(_mv, "reset_biomes"):
+        try:
+            _mv = _get_main_module()
+        except Exception as exc:
+            messagebox.showwarning("Not available", f"main_voider could not be loaded:\n{exc}")
+            return
+        if not hasattr(_mv, "reset_biomes"):
             messagebox.showwarning("Not available", "main_voider.reset_biomes is not available.")
             return
         all_dirs = _find_region_dirs(self.world)
@@ -1627,7 +1632,7 @@ class ChunkMapWindow(tk.Toplevel):
     def _check_lock(self):
         lock = self.world/"session.lock"
         if lock.exists():
-            self._warn_lbl.configure(text="Warning: session.lock is present. Minecraft may be open — avoid modifying files.")
+            self._warn_lbl.configure(text="Close Minecraft before writing. session.lock exists normally and is not an activity detector.")
             self._warn_frame.pack(fill="x", padx=10, pady=(8,0))
         else:
             self._warn_frame.pack_forget()
@@ -1647,6 +1652,17 @@ def _candidate_roots_windows() -> List[Path]:
     roots.update(Path(p) for p in glob.glob(str(appdata/"gdlauncher"/"instances" / "*" / ".minecraft" / "saves")))
     roots.update(Path(p) for p in glob.glob(str(appdata/".atlauncher"/"instances" / "*" / "saves")))
     roots.update(Path(p) for p in glob.glob(str(appdata/".atlauncher"/"instances" / "*" / ".minecraft" / "saves")))
+    if os.name != "nt":
+        linux_patterns = [
+            user/".minecraft"/"saves",
+            user/".local"/"share"/"PrismLauncher"/"instances"/"*"/"minecraft"/"saves",
+            user/".local"/"share"/"PrismLauncher"/"instances"/"*"/".minecraft"/"saves",
+            user/".local"/"share"/"prismlauncher"/"instances"/"*"/"minecraft"/"saves",
+            user/".var"/"app"/"org.prismlauncher.PrismLauncher"/"data"/"PrismLauncher"/"instances"/"*"/"minecraft"/"saves",
+            user/"Games"/"PrismLauncher"/"instances"/"*"/"minecraft"/"saves",
+        ]
+        for pattern in linux_patterns:
+            roots.update(Path(p) for p in glob.glob(str(pattern)))
     return [r for r in roots if r.exists()]
 
 def _read_world_name(level_dat:Path) -> str:

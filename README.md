@@ -1,118 +1,130 @@
+# GTNH World Voider 2.0.0
 
+A safety-first chunk voiding and biome-maintenance tool for Minecraft 1.7.x worlds, especially GregTech: New Horizons 2.8.x instances managed by Prism Launcher.
 
-# GTNH World Voider (1.7.x)
+## Safety model
 
-![Chunk selector + status window](https://github.com/Roaring1/-MinecraftWorld-Voider-PrismLauncher-GTNH-1.7.10-v2.8.0-/blob/main/image.png?raw=1)
+- **Dry run is the default.** Writing requires `--write` or unchecking **Dry run** in the GUI.
+- **Verified full-world ZIP backup is the default before writes.** Use `--no-backup` only if you deliberately accept the risk.
+- Region edits use copy-on-write and atomic replacement.
+- A region that changes during processing is rejected rather than overwritten.
+- Headless mode refuses an implicit whole-world operation: provide a selection or `--all-chunks`.
+- Selection JSON is schema- and type-validated.
 
-A safe chunk-voiding tool with provider-safe biome handling, a visual chunk selector, and a rules editor. Works great for GT: New Horizons 1.7.x worlds.
+Always close Minecraft before writing. `session.lock` normally remains after shutdown, so its presence alone is not a reliable activity signal.
 
----
+## Features
 
-## What it does
+- Provider-safe biome behavior for Overworld and modded dimensions.
+- Visual include/exclude chunk selector with JourneyMap overlays.
+- Rules by dimension for blocks, entities, and biome IDs.
+- Optional entity/tile-entity preservation or safety skips.
+- Spawn platforms with correct 1.7 Anvil indexing, metadata, extended block IDs, and cross-chunk placement.
+- GUI and validated headless CLI.
+- Windows and Linux/Nobara packaging.
 
-- **Provider-safe biome handling**
-  - **Overworld:** keep `Level.Biomes[256]` if present; otherwise write Plains (id=1).
-  - **Non-overworld:** keep `Level.Biomes` if present; otherwise **omit** the tag so the dimension provider recomputes on next load.
-- **Chunk selection UI** (`chunkmap_ui.py`) for include/exclude by dimension (JM overlay, snap-to-32×32, undo/redo).
-- **Rules Editor** with optional NEI “Dump ID Map” import.
-- **Maintenance:** Tools → **Reset Biomes** (All / Non-Overworld) using the provider-safe policy.
+## Linux / Nobara
 
----
+### Run from the checkout
 
-## What’s included
-
-- `Voider-GTNH.exe` — prebuilt one-file GUI for Windows.
-- `main_voider.py` — core app (status window, voider, rules editor, provider-safe biome reset).
-- `chunkmap_ui.py` — chunk selector UI.
-- `build_voider.ps1` — PowerShell builder that makes both **onedir** (diagnostic) and **onefile** (final) EXEs, with logs.
-- `requirements.txt` — minimal deps to run from source:
+```bash
+sudo dnf install python3 python3-pip python3-tkinter
+chmod +x run_voider.sh
+./run_voider.sh
 ```
 
-PyInstaller>=6.6
-Pillow>=10.3
-NBT==1.5.1
+The launcher creates `.venv-linux` and installs only Pillow and NBT.
 
-````
-- `.gitignore`, `.readme` — project docs.
+### Install for the current user
 
----
+```bash
+sudo dnf install python3 python3-pip python3-tkinter rsync desktop-file-utils
+chmod +x install_linux.sh
+./install_linux.sh
+```
 
-## How to run
+This installs a desktop entry and `~/.local/bin/gtnh-world-voider`.
 
-### Option A — Run the EXE (easiest)
+### Build native Linux bundles
 
-1. Download `Voider-GTNH.exe`.
-2. Double-click it.  
- If you don’t pass a world path, it will auto-discover worlds and open the chunk selector.
+```bash
+sudo dnf install python3 python3-pip python3-tkinter binutils
+chmod +x build_linux.sh
+./build_linux.sh
+```
 
-> The EXE is built with PyInstaller and embeds Tkinter. Some AV tools flag one-file EXEs; if you’re unsure, run from source or build locally (below).
+Artifacts appear in `dist/` as one-file and onedir builds plus SHA-256 sums.
 
----
-
-### Option B — Run from source (no binaries)
-
-```powershell
-# from the project folder:
-python -m venv .venv
-.\.venv\Scripts\pip install -r requirements.txt
-.\.venv\Scripts\python .\main_voider.py
-````
-
-Tested with Python 3.10–3.13 on Windows (Tkinter required).
-
----
-
-### Option C — Build your own EXE (local, reproducible)
+## Windows
 
 ```powershell
-# from the project folder:
+py -m venv .venv
+.\.venv\Scripts\python -m pip install -r requirements-build.txt
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\build_voider.ps1
 ```
 
-The script:
+## GUI workflow
 
-* creates `.venv`, installs deps,
-* sanity-checks imports,
-* builds **ONEDIR** (diagnostic) and **ONEFILE** (final),
-* writes logs to `build-logs\`.
-  Artifacts appear under `dist\`.
+1. Launch the tool and select a world containing `level.dat`.
+2. Open **Chunk Selector** and save include/exclude marks.
+3. Keep **Dry run** enabled and review the count.
+4. Close Minecraft.
+5. Disable **Dry run** only when the preview is correct.
+6. Keep the default verified backup enabled.
 
----
+## Headless workflow
 
-## Verifying / trust
+Preview a saved selection:
 
-If you want to verify the EXE you downloaded/built:
-
-```powershell
-certutil -hashfile .\dist\Voider-GTNH.exe SHA256
+```bash
+python3 main_voider.py '/path/to/world' --headless --selection selection.json
 ```
 
-Compare the hash to your expected value (e.g., your local build vs. the release artifact).
+Write after reviewing the preview:
 
----
+```bash
+python3 main_voider.py '/path/to/world' --headless --selection selection.json --write
+```
 
-## Notes & tips
+Explicitly authorize all chunks after filters:
 
-* **Safety first:** the tool only edits `.mca` files inside the world you choose. Back up first. Try **Dry run** to preview changes.
-* **JourneyMap overlay:** if a local JM cache exists, the selector can show day/topo/night/underground tiles; otherwise you still get the grid.
-* **session.lock warning:** close Minecraft before writing; the UI will warn if `session.lock` is present.
+```bash
+python3 main_voider.py '/path/to/world' --headless --all-chunks --only DIM-1/region --dry-run
+```
 
----
+The default selection path is `<world>/.voider-selection.json` when present.
 
-## Troubleshooting
+## Read-only verification
 
-* **AV false positive:** build locally (`build_voider.ps1`) or run from source.
-* **“tkinter not found” / blank window:** use the official python.org installer for Windows (includes Tk).
-* **EXE opens but the map is empty:** make sure the selected folder is a real world (has `level.dat`) and the chosen dimension contains region files.
+```bash
+python3 main_voider.py '/path/to/world' --verify-world --report world-audit.json
+```
 
----
+This checks sector ranges and overlap, NBT readability, and stored chunk coordinates without opening Tk or modifying the world.
 
-## Changelog (r11 highlights)
+## Tests
 
-* Fixed biome saving/reading/cleaning system (provider-safe policy).
-* Hardened region reader (handles odd gzip/zlib/raw cases and junk headers).
-* Chunk selector: JM overlay, snap-to-32×32, undo/redo, selected-only view, per-dim UI state.
-* Rules Editor with NEI dump import.
-* Tools menu: Reset Biomes (All / Non-Overworld).
+```bash
+python3 -m venv .venv-test
+.venv-test/bin/python -m pip install -r requirements-runtime.txt
+PYTHON=.venv-test/bin/python ./test.sh
+```
 
+The regression suite creates synthetic real-NBT Anvil regions and tests parsing, platform encoding, rules, atomic replacement, backups, and malformed selections.
+
+## Release
+
+See `PUBLISH_COMMANDS.md`. `prepare_release.sh` creates source/Linux-source archives and hashes without publishing anything.
+
+## Dependencies
+
+- Python 3.10+
+- Tkinter for GUI use
+- Pillow 10.3+
+- NBT 1.5.1
+- PyInstaller 6.6+ only for binary builds
+
+## License
+
+Copyright © 2026 Roaring1. All rights reserved. See `LICENSE`.

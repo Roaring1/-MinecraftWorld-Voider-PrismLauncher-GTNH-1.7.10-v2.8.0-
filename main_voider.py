@@ -7,7 +7,7 @@
 # - Fixes prior duplicate defs; same UI/CLI surface as r10 (+ one new flag and one GUI checkbox)
 
 from __future__ import annotations
-import os, sys, io, time, json, struct, zlib, argparse, threading, queue, logging
+import os, sys, io, time, json, struct, zlib, argparse, threading, queue, hashlib, shutil
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from zipfile import ZipFile, ZIP_DEFLATED
@@ -17,38 +17,44 @@ from typing import Optional, Tuple, List, Dict, Set, Callable
 # Third-party / sibling
 from nbt import nbt
 
-# Robust import of local sidecar module `chunkmap_ui`
-try:
-    import chunkmap_ui  # normal import (dev + most PyInstaller builds)
-except ModuleNotFoundError:
-    import importlib.util, sys, os
-    bases = [
-        getattr(sys, "_MEIPASS", ""),  # PyInstaller temp dir
-        os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else "",
-        os.path.dirname(__file__),     # project folder in dev
-        os.getcwd(),                   # current working dir
-    ]
-    candidates = []
-    for b in filter(None, bases):
-        candidates.append(os.path.join(b, "chunkmap_ui.py"))
-        candidates.append(os.path.join(b, "chunkmap_ui", "__init__.py"))
-    for path in candidates:
-        if os.path.exists(path):
-            spec = importlib.util.spec_from_file_location("chunkmap_ui", path)
-            mod = importlib.util.module_from_spec(spec)  # type: ignore
-            assert spec and spec.loader
-            spec.loader.exec_module(mod)  # type: ignore
-            sys.modules["chunkmap_ui"] = mod
-            chunkmap_ui = mod  # type: ignore  # noqa
-            break
-    else:
-        # Still not found — re-raise the original error
-        raise
-        
-# ---- expose symbols we call directly
-if not hasattr(chunkmap_ui, "launch_chunk_selector"):
-    raise ImportError("chunkmap_ui.launch_chunk_selector() is missing")
-launch_chunk_selector = chunkmap_ui.launch_chunk_selector  # convenience alias
+# Import the GUI only when it is requested. This keeps headless CLI/core use
+# functional on servers without Tk and avoids a main_voider <-> chunkmap_ui cycle.
+def _load_chunkmap_ui():
+    import importlib
+    import importlib.util
+    try:
+        return importlib.import_module("chunkmap_ui")
+    except ModuleNotFoundError as original:
+        # Only perform the sidecar fallback when chunkmap_ui itself is missing.
+        # A missing dependency inside chunkmap_ui (for example tkinter) must not
+        # be disguised as a missing sidecar.
+        if original.name != "chunkmap_ui":
+            raise
+        bases = [
+            getattr(sys, "_MEIPASS", ""),
+            os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else "",
+            os.path.dirname(__file__),
+            os.getcwd(),
+        ]
+        for base in filter(None, bases):
+            for path in (os.path.join(base, "chunkmap_ui.py"),
+                         os.path.join(base, "chunkmap_ui", "__init__.py")):
+                if not os.path.exists(path):
+                    continue
+                spec = importlib.util.spec_from_file_location("chunkmap_ui", path)
+                if spec is None or spec.loader is None:
+                    continue
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                sys.modules["chunkmap_ui"] = module
+                return module
+        raise original
+
+def launch_chunk_selector(*args, **kwargs):
+    module = _load_chunkmap_ui()
+    if not hasattr(module, "launch_chunk_selector"):
+        raise ImportError("chunkmap_ui.launch_chunk_selector() is missing")
+    return module.launch_chunk_selector(*args, **kwargs)
 
 
 # ---------------- Constants / globals ----------------
@@ -144,15 +150,18 @@ def _scan_and_decode(data: bytes) -> Optional[bytes]:
         except Exception:
             pos += 1
 
-    # 2) Try zlib from every offset
-    for start in range(0, len(data)):
+    # 2) Try offsets that can begin a valid zlib stream. Trying every byte
+    # becomes quadratic on a corrupted, fully allocated region record.
+    zlib_starts = [i for i in range(max(0, len(data)-1))
+                   if data[i] == 0x78 and ((data[i] << 8) + data[i+1]) % 31 == 0]
+    for start in zlib_starts:
         try:
             return zlib.decompress(data[start:])
         except Exception:
             pass
 
-    # 3) Raw DEFLATE from every offset
-    for start in range(0, len(data)):
+    # 3) Raw DEFLATE has no magic; tolerate only a small junk prefix.
+    for start in range(0, min(len(data), 64)):
         try:
             return zlib.decompress(data[start:], wbits=-15)
         except Exception:
@@ -162,7 +171,7 @@ def _scan_and_decode(data: bytes) -> Optional[bytes]:
     for start in range(0, len(data) - 3):
         if data[start] == 0x0A and start + 2 < len(data) and data[start+1] == 0x00:
             try:
-                nbt.NBTFile(fileobj=io.BytesIO(data[start:]))
+                nbt.NBTFile(buffer=io.BytesIO(data[start:]))
                 return data[start:]
             except Exception:
                 pass
@@ -224,12 +233,14 @@ def _write_chunk_payload(fp, sector_off:int, sector_cnt:int, raw_nbt:bytes):
     body = bytes([2]) + zlib.compress(raw_nbt)  # write back as zlib
     payload = struct.pack(">I", len(body)) + body
     need = (len(payload) + SECTOR_BYTES - 1) // SECTOR_BYTES
+    if need > 0xFF:
+        raise ValueError(f"Chunk payload needs {need} sectors; Anvil header limit is 255")
     if need > sector_cnt:
         fp.seek(0, os.SEEK_END)
-        new_off = fp.tell() // SECTOR_BYTES
         pad = (-fp.tell()) % SECTOR_BYTES
         if pad:
             fp.write(b"\x00"*pad)
+        new_off = fp.tell() // SECTOR_BYTES
         fp.write(payload)
         pad2 = (-len(payload)) % SECTOR_BYTES
         if pad2:
@@ -271,7 +282,7 @@ def _dim_tag(world:Path, region_dir:Path) -> str:
 # ---------------- Biomes / flags ----------------
 def _nbt_from_raw(raw:bytes) -> Optional[nbt.NBTFile]:
     try:
-        return nbt.NBTFile(fileobj=io.BytesIO(raw))
+        return nbt.NBTFile(buffer=io.BytesIO(raw))
     except Exception:
         return None
 
@@ -321,6 +332,13 @@ def _nibble_get(arr: Optional[bytes], idx:int)->int:
     b = arr[idx >> 1]
     return (b & 0x0F) if (idx & 1) == 0 else ((b >> 4) & 0x0F)
 
+def _nibble_set(arr, idx:int, value:int)->None:
+    """Set one 4-bit value in a legacy Anvil nibble array."""
+    pos = idx >> 1
+    old = arr[pos]
+    value &= 0x0F
+    arr[pos] = ((old & 0xF0) | value) if (idx & 1) == 0 else ((old & 0x0F) | (value << 4))
+
 def _iter_blocks_17(raw:bytes):
     nb = _nbt_from_raw(raw)
     if not nb: return
@@ -338,7 +356,7 @@ def _iter_blocks_17(raw:bytes):
             base_y = ysec*16 + ly
             for lz in range(16):
                 for lx in range(16):
-                    idx = ly + (lz * 16) + (lx * 256)  # YZX
+                    idx = (ly * 256) + (lz * 16) + lx  # Y-Z-X
                     base = blocks[idx]
                     hi   = _nibble_get(add, idx)
                     full = (hi << 8) | base
@@ -418,6 +436,38 @@ def _save_rules(world:Path, rules:AllRules)->None:
             "enabled": rs.enabled,
         }
     _rules_path(world).write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+def _load_selection(path:Path)->Tuple[Dict[str, Set[Tuple[int,int]]], Dict[str, Set[Tuple[int,int]]]]:
+    """Load and strictly validate a chunk-selection JSON file."""
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("Selection root must be an object keyed by dimension tag")
+    includes: Dict[str, Set[Tuple[int,int]]] = {}
+    excludes: Dict[str, Set[Tuple[int,int]]] = {}
+    total = 0
+    for dimtag, payload in raw.items():
+        if not isinstance(dimtag, str) or not dimtag or not isinstance(payload, dict):
+            raise ValueError("Every selection entry must be a named dimension object")
+        parsed = {}
+        for mode in ("include", "exclude"):
+            values = payload.get(mode, [])
+            if not isinstance(values, list):
+                raise ValueError(f"{dimtag}.{mode} must be a list")
+            coords: Set[Tuple[int,int]] = set()
+            for item in values:
+                if (not isinstance(item, (list, tuple)) or len(item) != 2 or
+                        any(isinstance(v, bool) or not isinstance(v, int) for v in item)):
+                    raise ValueError(f"Invalid chunk coordinate in {dimtag}.{mode}: {item!r}")
+                coords.add((item[0], item[1]))
+            total += len(coords)
+            if total > 5_000_000:
+                raise ValueError("Selection exceeds the 5,000,000-coordinate safety limit")
+            parsed[mode] = coords
+        # Exclusion is the safety-biased winner if malformed input contains both.
+        parsed["include"].difference_update(parsed["exclude"])
+        includes[dimtag] = parsed["include"]
+        excludes[dimtag] = parsed["exclude"]
+    return includes, excludes
 
 def _should_void_chunk_by_rules(dimtag:str, raw:bytes, rules:AllRules)->bool:
     rs = rules.by_dim.get(dimtag)
@@ -499,7 +549,7 @@ def _build_void_chunk(
 
     if source_raw and (keep_entities or keep_tileentities):
         try:
-            src = nbt.NBTFile(fileobj=io.BytesIO(source_raw))
+            src = nbt.NBTFile(buffer=io.BytesIO(source_raw))
             lvl = src["Level"]
             if keep_entities and "Entities" in lvl and isinstance(lvl["Entities"], nbt.TAG_List):
                 ents = lvl["Entities"]
@@ -541,6 +591,8 @@ def _build_void_chunk(
     zeros2048  = [0] * 2048
     skylight_ff= [0xFF] * 2048
     sec_blocks = []
+    sec_data = []
+    sec_add = []
 
     for y in range(16):
         sec = nbt.TAG_Compound()
@@ -554,6 +606,8 @@ def _build_void_chunk(
         sec.tags.extend([blk, dat, sky, bl])
         sections.tags.append(sec)
         sec_blocks.append(blk)
+        sec_data.append(dat)
+        sec_add.append(None)
 
     if mark_void:
         lvl.tags.append(nbt.TAG_Byte(name="Voider", value=1))
@@ -574,8 +628,19 @@ def _build_void_chunk(
                     if (wx // 16) == cx_abs and (wz // 16) == cz_abs:
                         xl  = wx & 15
                         zl  = wz & 15
-                        idx = y_in + (zl * 16) + (xl * 256)  # YZX index
+                        # Legacy Anvil section arrays are indexed Y-Z-X:
+                        # index = y*256 + z*16 + x.
+                        idx = (y_in * 256) + (zl * 16) + xl
                         sec_blocks[secY].value[idx] = bid & 0xFF
+                        _nibble_set(sec_data[secY].value, idx, meta & 0x0F)
+                        high = (bid >> 8) & 0x0F
+                        if high:
+                            if sec_add[secY] is None:
+                                add_tag = nbt.TAG_Byte_Array(name="Add")
+                                add_tag.value = [0] * 2048
+                                sections[secY].tags.append(add_tag)
+                                sec_add[secY] = add_tag
+                            _nibble_set(sec_add[secY].value, idx, high)
 
     outb = io.BytesIO()
     root.write_file(buffer=outb)
@@ -593,7 +658,7 @@ def _read_biomes_from_region(region_path: Path, idx: int) -> Optional[bytes]:
             raw = _read_chunk_payload(fp, off, cnt)  # tolerant
             if not raw:
                 return None
-            nb = nbt.NBTFile(fileobj=io.BytesIO(raw))
+            nb = nbt.NBTFile(buffer=io.BytesIO(raw))
             lvl = nb["Level"]
             if "Biomes" in lvl and isinstance(lvl["Biomes"], nbt.TAG_Byte_Array):
                 b = bytes(lvl["Biomes"].value)
@@ -625,15 +690,30 @@ def _radius_ok(cx_abs:int, cz_abs:int, center:Optional[Tuple[int,int]], r:int)->
     dz = 0 if minz<=cz<=maxz else min(abs(cz-minz), abs(cz-maxz))
     return dx*dx + dz*dz <= r*r
 
+def _platform_intersects_chunk(platform, cx_abs:int, cz_abs:int)->bool:
+    if not platform:
+        return False
+    px, pz, _py, size, _bid, _meta = platform
+    half = size // 2
+    plat_x1, plat_x2 = px - half, px + half
+    plat_z1, plat_z2 = pz - half, pz + half
+    chunk_x1, chunk_x2 = cx_abs * 16, cx_abs * 16 + 15
+    chunk_z1, chunk_z2 = cz_abs * 16, cz_abs * 16 + 15
+    return not (plat_x2 < chunk_x1 or chunk_x2 < plat_x1 or
+                plat_z2 < chunk_z1 or chunk_z2 < plat_z1)
+
 # ---------------- Per-region worker ----------------
-def _process_region(mca:Path, dimtag:str, bbox, center, radius_blocks:int,
+def _process_region_inplace(mca:Path, dimtag:str, bbox, center, radius_blocks:int,
                     include_void:bool, platform, keep_entities:bool, keep_tileentities:bool,
                     skip_if_entities:bool, skip_if_tileentities:bool, mark_void:bool,
                     dry_run:bool, strict:bool, sel_include:Set[Tuple[int,int]],
                     sel_exclude:Set[Tuple[int,int]], restore_biomes_from_bak:bool,
                     nether_cosmetic_placeholder:bool,
-                    cancel_event:Optional[threading.Event]=None)->Tuple[str,int,int]:
-    rx, rz = _region_coords_from_name(mca)
+                    rules:Optional[AllRules]=None,
+                    cancel_event:Optional[threading.Event]=None,
+                    _region_coords:Optional[Tuple[int,int]]=None,
+                    _source_region:Optional[Path]=None)->Tuple[str,int,int]:
+    rx, rz = _region_coords or _region_coords_from_name(mca)
     changed=0; scanned=0
     pop_flag = 1 if dimtag == "region" else 0  # Overworld stays populated; others must repopulate
     with open(mca,"r+b") as fp:
@@ -653,7 +733,7 @@ def _process_region(mca:Path, dimtag:str, bbox, center, radius_blocks:int,
                 continue
             scanned += 1
 
-            if not _should_void_chunk_by_rules(dimtag, raw, _GLOBAL_RULES):
+            if not _should_void_chunk_by_rules(dimtag, raw, rules or _GLOBAL_RULES):
                 continue
 
             te,en = _has_entities(raw)
@@ -661,18 +741,14 @@ def _process_region(mca:Path, dimtag:str, bbox, center, radius_blocks:int,
             if skip_if_tileentities and te: continue
 
             already_void = _is_void_chunk(raw)
-            platform_needed=False
-            if platform:
-                px,pz,py,size,bid,meta = platform
-                if (cx_abs==px//16) and (cz_abs==pz//16):
-                    platform_needed=True
+            platform_needed = _platform_intersects_chunk(platform, cx_abs, cz_abs)
             if already_void and not platform_needed and not include_void:
                 continue
 
             # Biome policy for writing the new chunk:
             biome_src = _get_biomes(raw)
             if biome_src is None and restore_biomes_from_bak:
-                biome_src = _copy_biomes_from_backup_if_available(mca, idx)
+                biome_src = _copy_biomes_from_backup_if_available(_source_region or mca, idx)
 
             if dimtag == "region":
                 # Overworld: write Plains(1) if missing; otherwise keep existing biomes
@@ -700,6 +776,49 @@ def _process_region(mca:Path, dimtag:str, bbox, center, radius_blocks:int,
             _update_header(fp, idx, new_off, new_cnt)
             changed += 1
     return (mca.name, scanned, changed)
+
+def _fsync_directory(path:Path)->None:
+    """Best-effort durability barrier after an atomic replacement."""
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+def _process_region(mca:Path, *args, **kwargs)->Tuple[str,int,int]:
+    """Process a copied region and atomically replace the original on success."""
+    if kwargs.get("dry_run", False):
+        return _process_region_inplace(mca, *args, **kwargs)
+
+    coords = _region_coords_from_name(mca)
+    temp = mca.with_name(f".{mca.name}.voider-{os.getpid()}-{threading.get_ident()}.tmp")
+    try:
+        before = mca.stat()
+        source_signature = (before.st_size, before.st_mtime_ns)
+        if temp.exists():
+            temp.unlink()
+        shutil.copy2(mca, temp)
+        work_kwargs = dict(kwargs)
+        work_kwargs["_region_coords"] = coords
+        work_kwargs["_source_region"] = mca
+        _tmp_name, scanned, changed = _process_region_inplace(temp, *args, **work_kwargs)
+        if changed:
+            current = mca.stat()
+            if (current.st_size, current.st_mtime_ns) != source_signature:
+                raise RuntimeError(f"Region changed concurrently; refusing replacement: {mca}")
+            os.replace(temp, mca)
+            _fsync_directory(mca.parent)
+        else:
+            temp.unlink(missing_ok=True)
+        return mca.name, scanned, changed
+    except BaseException:
+        temp.unlink(missing_ok=True)
+        raise
 
 # ---------------- Discovery / cache ----------------
 def _get_drive_letters_windows()->List[Path]:
@@ -743,7 +862,18 @@ def _candidate_roots()->List[Path]:
     if os.name=="nt":
         roots.extend(_get_drive_letters_windows())
     else:
-        roots.extend([Path("/"), Path.home(), Path("/mnt"), Path("/media"), Path("/Volumes")])
+        home = Path.home()
+        roots.extend([
+            home/".minecraft"/"saves",
+            home/".local"/"share"/"PrismLauncher"/"instances",
+            home/".local"/"share"/"prismlauncher"/"instances",
+            home/".var"/"app"/"org.prismlauncher.PrismLauncher"/"data"/"PrismLauncher"/"instances",
+            home/".local"/"share"/"MultiMC"/"instances",
+            home/".local"/"share"/"multimc"/"instances",
+            home/"PrismLauncher"/"instances",
+            home/"Games"/"PrismLauncher"/"instances",
+            Path("/mnt"), Path("/media"), Path("/run/media"), Path("/Volumes"),
+        ])
 
     out=[]; seen=set()
     for r in roots:
@@ -860,7 +990,7 @@ def reset_biomes(world: Path, dims: Optional[List[str]] = None, *, progress_cb=N
                     unreadable += 1
                     continue
                 try:
-                    nb = nbt.NBTFile(fileobj=io.BytesIO(raw))
+                    nb = nbt.NBTFile(buffer=io.BytesIO(raw))
                     lvl = nb["Level"]
 
                     # helpers
@@ -922,14 +1052,22 @@ def reset_biomes(world: Path, dims: Optional[List[str]] = None, *, progress_cb=N
 
 # ---------------- Backups ----------------
 def _backup_world_zip(world:Path):
-    z=world.with_suffix(".void-backup.zip")
-    if z.exists():
-        print(f"Backup already exists: {z.name}"); return z
+    stamp=time.strftime("%Y%m%d-%H%M%S")
+    z=world.parent/f"{world.name}.void-backup-{stamp}.zip"
+    serial=1
+    while z.exists():
+        z=world.parent/f"{world.name}.void-backup-{stamp}-{serial}.zip"; serial+=1
     with ZipFile(z,"w",ZIP_DEFLATED) as zf:
         for root,_,files in os.walk(world):
             for nm in files:
                 p=Path(root)/nm; zf.write(p, arcname=str(p.relative_to(world)))
-    print(f"World backup created: {z.name}"); return z
+    with ZipFile(z,"r") as zf:
+        bad=zf.testzip()
+        if bad:
+            raise IOError(f"Backup verification failed at {bad}")
+    digest=hashlib.sha256(z.read_bytes()).hexdigest()
+    print(f"World backup created and verified: {z.name} (SHA-256 {digest})")
+    return z
 
 def _per_file_backup(world:Path):
     for rdir in _find_region_dirs(world):
@@ -937,6 +1075,59 @@ def _per_file_backup(world:Path):
             bak=mca.with_suffix(mca.suffix+".bak")
             if not bak.exists():
                 bak.write_bytes(mca.read_bytes())
+
+def _region_snapshot(world:Path)->Dict[Path, Tuple[int,int]]:
+    snapshot={}
+    for rdir in _find_region_dirs(world):
+        for mca in rdir.glob("r.*.*.mca"):
+            stat=mca.stat()
+            snapshot[mca]=(stat.st_size, stat.st_mtime_ns)
+    return snapshot
+
+def verify_world(world:Path)->Dict[str, object]:
+    """Read-only audit of sector ranges, overlaps, NBT, and chunk coordinates."""
+    report: Dict[str, object] = {"world": str(world), "region_files": 0, "chunks": 0,
+                                "valid_chunks": 0, "errors": [], "files": []}
+    errors = report["errors"]
+    files_report = report["files"]
+    for rdir in _find_region_dirs(world):
+        for mca in sorted(rdir.glob("r.*.*.mca")):
+            info = {"path": str(mca.relative_to(world)), "chunks": 0, "valid": 0, "errors": []}
+            file_errors = info["errors"]
+            report["region_files"] += 1
+            try:
+                rx, rz = _region_coords_from_name(mca)
+                with mca.open("rb") as fp:
+                    offsets, _ = _read_header(fp)
+                    fp.seek(0, os.SEEK_END); file_size = fp.tell()
+                    occupied: Set[int] = set()
+                    for idx, entry in enumerate(offsets):
+                        if not entry: continue
+                        info["chunks"] += 1; report["chunks"] += 1
+                        off, count = _parse_loc(entry); label = f"{mca.name}:{idx}"
+                        if off < 2 or count < 1 or (off + count) * SECTOR_BYTES > file_size:
+                            file_errors.append(f"{label}: invalid sector range off={off} count={count}"); continue
+                        sectors = set(range(off, off + count))
+                        if occupied & sectors:
+                            file_errors.append(f"{label}: overlapping sector allocation"); continue
+                        occupied.update(sectors)
+                        raw = _read_chunk_payload(fp, off, count)
+                        parsed = _nbt_from_raw(raw) if raw else None
+                        if parsed is None or "Level" not in parsed:
+                            file_errors.append(f"{label}: unreadable NBT payload"); continue
+                        level = parsed["Level"]
+                        expected = (rx*32 + idx%32, rz*32 + idx//32)
+                        actual = ((int(level["xPos"].value), int(level["zPos"].value))
+                                  if "xPos" in level and "zPos" in level else None)
+                        if actual != expected:
+                            file_errors.append(f"{label}: coordinates {actual!r}, expected {expected!r}"); continue
+                        info["valid"] += 1; report["valid_chunks"] += 1
+            except Exception as exc:
+                file_errors.append(f"{mca.name}: {type(exc).__name__}: {exc}")
+            errors.extend(f"{info['path']}: {msg}" for msg in file_errors)
+            files_report.append(info)
+    report["ok"] = not errors
+    return report
 
 # ---------------- UI helpers: Tee + Tooltip ----------------
 class _TeeIO:
@@ -1336,7 +1527,7 @@ class VoiderStatusUI:
             def prog(done,total,line):
                 pct=int((done/total)*100) if total else 0
                 print(f"{pct}% — {line}")
-                self.progress.configure(value=pct)
+                self._set_progress(pct)
             n=reset_biomes(Path(wp), None, progress_cb=prog)
             print(f"Reset biomes in {n} chunk(s). Providers will refill on next load.")
             self._set_status("Idle.")
@@ -1355,7 +1546,7 @@ class VoiderStatusUI:
             def prog(done,total,line):
                 pct=int((done/total)*100) if total else 0
                 print(f"{pct}% — {line}")
-                self.progress.configure(value=pct)
+                self._set_progress(pct)
             n=reset_biomes(w, dims, progress_cb=prog)
             print(f"Reset biomes in {n} chunk(s). Providers will refill on next load.")
             self._set_status("Idle.")
@@ -1419,11 +1610,13 @@ class VoiderStatusUI:
         def bg():
             self._set_status("Discovering worlds…")
             found=discover_minecraft_worlds(force_rescan=True, status_cb=self._set_status)
-            pick=choose_world_gui(found)
-            if pick:
-                self.world_var.set(pick)
-                self._prime_nei(Path(pick))
-            self._set_status("Discovery done.")
+            def finish():
+                pick=choose_world_gui(found)
+                if pick:
+                    self.world_var.set(pick)
+                    self._prime_nei(Path(pick))
+                self._set_status("Discovery done.")
+            self.tk.after(0, finish)
         threading.Thread(target=bg, daemon=True).start()
 
     def _prime_nei(self, world_path:Path):
@@ -1485,10 +1678,7 @@ class VoiderStatusUI:
                 sel_exclude: Dict[str, Set[Tuple[int,int]]] = {}
                 if sel_path.exists():
                     try:
-                        data=json.loads(sel_path.read_text(encoding="utf-8"))
-                        for dimtag,d in data.items():
-                            sel_include[dimtag]=set(tuple(x) for x in d.get("include",[]))
-                            sel_exclude[dimtag]=set(tuple(x) for x in d.get("exclude",[]))
+                        sel_include, sel_exclude = _load_selection(sel_path)
                         print(f"Loaded selection from {sel_path.name}")
                     except Exception as e:
                         print(f"[warn] Failed to read selection JSON: {e!r}")
@@ -1497,18 +1687,19 @@ class VoiderStatusUI:
                 def prog_cb(done, total, line):
                     with prog_lock:
                         pct=int((done/total)*100) if total else 0
-                    self.progress.configure(value=pct); self._set_status(f"{pct}% — {line}")
+                    self._set_progress(pct); self._set_status(f"{pct}% — {line}")
 
                 total_scanned, total_changed = run_voider(
                     world, sel_include, sel_exclude, self.args,
-                    progress_cb=prog_cb, status_cb=self._set_status, cancel_event=self.cancel_event,
+                    progress_cb=prog_cb, status_cb=self._set_status, rules=rules_local,
+                    cancel_event=self.cancel_event,
                 )
                 msg = (f"Would void {total_changed} chunk(s) out of {total_scanned} scanned. Biomes provider-safe."
                        if self.args.dry_run else
                        f"Done. Voided {total_changed} chunk(s) out of {total_scanned} scanned. Biomes provider-safe.")
                 print(msg); self._set_status("Idle.")
             finally:
-                self.btn_start.configure(state="normal"); self.btn_cancel.configure(state="disabled")
+                self._set_running(False)
 
         self.worker_thread = threading.Thread(target=run, daemon=True); self.worker_thread.start()
 
@@ -1516,7 +1707,23 @@ class VoiderStatusUI:
         if self.worker_thread and self.worker_thread.is_alive():
             self.cancel_event.set(); self._set_status("Cancelling…")
 
-    def _set_status(self, s:str): self.status_var.set(s)
+    def _ui_call(self, callback)->None:
+        if threading.current_thread() is threading.main_thread():
+            callback()
+        else:
+            self.tk.after(0, callback)
+
+    def _set_status(self, s:str)->None:
+        self._ui_call(lambda: self.status_var.set(s))
+
+    def _set_progress(self, value:int)->None:
+        self._ui_call(lambda: self.progress.configure(value=value))
+
+    def _set_running(self, running:bool)->None:
+        def apply():
+            self.btn_start.configure(state="disabled" if running else "normal")
+            self.btn_cancel.configure(state="normal" if running else "disabled")
+        self._ui_call(apply)
 
     def _save_log(self):
         from tkinter import filedialog, messagebox
@@ -1601,6 +1808,7 @@ def run_voider(world:Path,
                *,
                progress_cb:Optional[Callable[[int,int,str],None]]=None,
                status_cb:Optional[Callable[[str],None]]=None,
+               rules:Optional[AllRules]=None,
                cancel_event:Optional[threading.Event]=None)->Tuple[int,int]:
     """
     Returns: (total_scanned, total_changed)
@@ -1609,6 +1817,9 @@ def run_voider(world:Path,
     if args.platform_x is not None and args.platform_z is not None:
         size=int(args.platform_size)
         if size<=0 or size%2==0: raise SystemExit("Platform size must be a positive odd number.")
+        if not 0 <= int(args.platform_y) <= 255: raise SystemExit("Platform Y must be in 0..255.")
+        if not 0 <= int(args.platform_id) <= 4095: raise SystemExit("Platform block ID must be in 0..4095.")
+        if not 0 <= int(args.platform_meta) <= 15: raise SystemExit("Platform metadata must be in 0..15.")
         platform=(args.platform_x, args.platform_z, args.platform_y, size, args.platform_id, args.platform_meta)
 
     only=[s.strip() for s in args.only.split(",")] if args.only else None
@@ -1629,19 +1840,17 @@ def run_voider(world:Path,
 
     if args.backup and not args.dry_run:
         if status_cb: status_cb("Creating world ZIP backup…")
+        before_backup=_region_snapshot(world)
         _backup_world_zip(world)
+        if _region_snapshot(world) != before_backup:
+            raise RuntimeError("World region files changed during backup; close Minecraft and retry")
     if args.per_file_backup and not args.dry_run:
         if status_cb: status_cb("Creating per-file .bak copies…")
         _per_file_backup(world)
 
     if args.wait_for_unlock and args.wait_for_unlock>0:
-        lock=world/"session.lock"; start=time.time()
-        if status_cb: status_cb(f"Waiting for session.lock (up to {args.wait_for_unlock}s)…")
-        while lock.exists():
-            if time.time()-start > args.wait_for_unlock:
-                print("session.lock still present; aborting to avoid corruption.")
-                return (0,0)
-            time.sleep(1)
+        print("[warning] --wait-for-unlock is deprecated: session.lock normally persists after shutdown. "
+              "Concurrent region changes are detected directly instead.")
 
     file_list: List[Tuple[str, Path]] = []
     for rdir in region_dirs:
@@ -1664,6 +1873,7 @@ def run_voider(world:Path,
             mark_void=bool(args.mark_void), dry_run=bool(args.dry_run), strict=False,
             sel_include=inc_set, sel_exclude=exc_set, restore_biomes_from_bak=bool(args.restore_biomes),
             nether_cosmetic_placeholder=bool(args.nether_cosmetic_placeholder),
+            rules=rules,
             cancel_event=cancel_event
         )
         line=f"{'would void' if args.dry_run else 'voided'}: {nm} ({changed} of {scanned} chunks)"
@@ -1719,9 +1929,17 @@ def main()->bool:
     ap.add_argument("--platform-size", type=int, default=3, help="Platform edge length (odd)")
     ap.add_argument("--platform-id", type=int, default=7, help="Block ID of platform")
     ap.add_argument("--platform-meta", type=int, default=0, help="Block meta value")
-    ap.add_argument("--backup", action="store_true", help="Backup world zip before voiding")
+    backup_group=ap.add_mutually_exclusive_group()
+    backup_group.add_argument("--backup", dest="backup", action="store_true", default=True,
+                              help="Create a verified world ZIP before writing (default)")
+    backup_group.add_argument("--no-backup", dest="backup", action="store_false",
+                              help="Skip the default world ZIP backup (unsafe)")
     ap.add_argument("--per-file-backup", action="store_true", help="Backup each region file before modify")
-    ap.add_argument("--dry-run", action="store_true", help="Do not modify files; just report")
+    mode_group=ap.add_mutually_exclusive_group()
+    mode_group.add_argument("--dry-run", dest="dry_run", action="store_true", default=True,
+                            help="Preview only; do not modify files (default)")
+    mode_group.add_argument("--write", dest="dry_run", action="store_false",
+                            help="Enable world modifications")
     ap.add_argument("--include-void", action="store_true", help="Rewrite already void chunks too")
     ap.add_argument("--wait-for-unlock", type=int, default=0, help="Seconds to wait if session.lock present")
     ap.add_argument("--workers", type=int, default=1, help="Number of worker threads (>=1)")
@@ -1743,8 +1961,54 @@ def main()->bool:
                     help="Disable Nether placeholder biomes (DIM-1).")
 
     ap.add_argument("--rules-editor", action="store_true", help="Open Rules Editor immediately (GUI)")
+    ap.add_argument("--headless", action="store_true", help="Run without Tk or the chunk selector")
+    ap.add_argument("--selection", type=str, help="Selection JSON to use in headless mode")
+    ap.add_argument("--all-chunks", action="store_true",
+                    help="Explicitly process all chunks after other filters (headless safety gate)")
+    ap.add_argument("--verify-world", action="store_true",
+                    help="Read-only audit of region sectors, NBT, and coordinates")
+    ap.add_argument("--report", type=str, help="Write a JSON verification/run report")
 
     args=ap.parse_args()
+
+    if args.verify_world:
+        if not args.world: ap.error("--verify-world requires a world path")
+        world=Path(args.world).expanduser().resolve()
+        if not (world/"level.dat").is_file(): ap.error(f"level.dat not found under {world}")
+        report=verify_world(world); rendered=json.dumps(report, indent=2)
+        print(rendered)
+        if args.report: Path(args.report).expanduser().write_text(rendered+"\n", encoding="utf-8")
+        return bool(report["ok"])
+
+    if args.headless:
+        if not args.world:
+            ap.error("--headless requires a world path")
+        world=Path(args.world).expanduser().resolve()
+        if not (world/"level.dat").is_file():
+            ap.error(f"level.dat not found under {world}")
+        selection_path = Path(args.selection).expanduser().resolve() if args.selection else world/".voider-selection.json"
+        if selection_path.exists():
+            try:
+                sel_include, sel_exclude = _load_selection(selection_path)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                ap.error(f"invalid selection file {selection_path}: {exc}")
+            print(f"Loaded validated selection: {selection_path}")
+        elif args.all_chunks:
+            sel_include, sel_exclude = {}, {}
+            print("No selection file; --all-chunks explicitly authorizes the filtered world scope.")
+        else:
+            ap.error("headless mode requires --selection, an existing .voider-selection.json, or --all-chunks")
+        rules=_load_rules(world)
+        scanned, changed=run_voider(world, sel_include, sel_exclude, args, rules=rules)
+        verb="Would void" if args.dry_run else "Voided"
+        print(f"{verb} {changed} chunk(s) out of {scanned} scanned.")
+        if args.report:
+            result={"world": str(world), "mode": "dry-run" if args.dry_run else "write",
+                    "scanned_chunks": scanned, "changed_chunks": changed,
+                    "selection": str(selection_path) if selection_path.exists() else None,
+                    "all_chunks": bool(args.all_chunks), "backup_enabled": bool(args.backup)}
+            Path(args.report).expanduser().write_text(json.dumps(result, indent=2)+"\n", encoding="utf-8")
+        return True
 
     if args.reset_biomes_dims:
         world_path: Optional[str] = args.world
@@ -1813,7 +2077,7 @@ def main()->bool:
 
         rules=_load_rules(world)
 
-        total_scanned, total_changed = run_voider(world, sel_include, sel_exclude, args)
+        total_scanned, total_changed = run_voider(world, sel_include, sel_exclude, args, rules=rules)
         print(f"{'Would void' if args.dry_run else 'Done.'} Voided {total_changed} chunk(s) out of {total_scanned} scanned. Biomes provider-safe.")
         return True
 
@@ -1833,4 +2097,3 @@ if __name__ == "__main__":
             pass
         print(tb, file=sys.stderr)
         sys.exit(1)
-

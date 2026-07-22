@@ -1,3 +1,1 @@
-PyInstaller>=6.6
-Pillow>=10.3
-NBT==1.5.1
+-r requirements-runtime.txt

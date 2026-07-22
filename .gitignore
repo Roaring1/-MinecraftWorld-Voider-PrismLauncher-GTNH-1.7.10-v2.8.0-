@@ -1,21 +1,13 @@
-
-**.gitignore**
-```gitignore
-# Python
 __pycache__/
-*.pyc
+*.py[cod]
 .venv/
-
-# PyInstaller
+.venv-*/
+.build_tmp/
 build/
 dist/
-*.spec
-
-# Logs/temps
+release-out/
 build-logs/
-.build_tmp/
-*.log
-
-# OS
-.DS_Store
-Thumbs.db
+*.spec
+*.bak
+*.void-backup-*.zip
+.voider-*.json
