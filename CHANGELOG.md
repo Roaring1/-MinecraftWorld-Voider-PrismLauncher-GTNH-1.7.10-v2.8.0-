@@ -5,6 +5,7 @@
 ### Safety and transaction handling
 - Hold an in-process per-world mutex and the operating-system session lock across each write transaction; fail closed when the lock mechanism is unavailable.
 - Verify full-world backups with an inventory, CRC checks, per-file SHA-256 manifest, and source-stability checks.
+- Exclude the transient root `session.lock` from backup contents while recording the omission in the manifest, allowing Windows backups to run while the write guard is held.
 - Stage biome reset across all selected region files, verify the result, and roll back committed region files if verification fails.
 - Treat malformed NBT, chunk-coordinate mismatches, region-worker exceptions, and cancellation as failed/incomplete runs rather than successful skips.
 - Prevent orphan TileEntities by skipping TileEntity-bearing chunks when preservation is requested instead of copying their block entities into empty terrain.
@@ -17,7 +18,6 @@
 - Add regressions for extended IDs, metadata preservation, rollback, lock reentrancy, backup manifests, and server-root path traversal.
 - Fail closed on selection files with no dimension scopes; selection runs are limited to named dimensions, and explicit `--all-chunks` overrides saved selections.
 - Keep headless CLI failures non-interactive so a Tk modal cannot stall a command-line run or CI; use a writable file handle for the Windows durability flush.
-- Exclude the transient root `session.lock` from ZIP backups so Windows byte-range locks do not block backup reads while the world-write guard is held.
 
 ## 2.1.0 — 2026-07-21
 
