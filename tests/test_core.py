@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -313,6 +314,197 @@ class SelectionAndHeadlessTests(unittest.TestCase):
             report = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertEqual(report["preset"], "safe-void")
             self.assertTrue(report["post_write_verification"]["ok"])
+
+
+
+class HardeningRegressionTests(unittest.TestCase):
+    def _world(self, root: Path, name: str = "VOIDER_HARDENING_FIXTURE_DISPOSABLE_DO_NOT_IMPORT") -> Path:
+        world = root / name
+        world.mkdir(parents=True)
+        (world / "level.dat").write_bytes(b"synthetic test fixture, not a playable save")
+        return world
+
+    @staticmethod
+    def _write_args(**overrides):
+        values = dict(
+            platform_x=None, platform_z=None, platform_size=3, platform_y=64,
+            platform_id=7, platform_meta=0, only=None, exclude=None, bbox=None,
+            center_x=None, center_z=None, radius_blocks=0, dry_run=False,
+            backup=True, per_file_backup=False, wait_for_unlock=0,
+            include_void=True, keep_entities=False, keep_tileentities=False,
+            skip_if_entities=False, skip_if_tileentities=False, mark_void=True,
+            restore_biomes=False, nether_cosmetic_placeholder=True, workers=1,
+        )
+        values.update(overrides)
+        return Namespace(**values)
+
+    def test_void_detection_includes_extended_block_ids(self):
+        raw = mv._build_void_chunk(0, 0, bytes([1] * 256), True, None,
+                                   False, False, None, 1)
+        parsed = mv.nbt.NBTFile(buffer=io.BytesIO(raw))
+        section = parsed["Level"]["Sections"][0]
+        add = mv.nbt.TAG_Byte_Array(name="Add")
+        add.value = [0] * 2048
+        mv._nibble_set(add.value, 0, 1)
+        section.tags.append(add)
+        output = io.BytesIO()
+        parsed.write_file(buffer=output)
+        self.assertFalse(mv._is_void_chunk(output.getvalue()))
+
+    def test_backup_manifest_hashes_each_world_file(self):
+        with tempfile.TemporaryDirectory(prefix="voider-backup-fixture-") as td:
+            world = self._world(Path(td))
+            payload = b"important world data"
+            (world / "region.dat").write_bytes(payload)
+            archive_path = mv._backup_world_zip(world)
+            with zipfile.ZipFile(archive_path) as archive:
+                self.assertIsNone(archive.testzip())
+                manifest = json.loads(archive.read(".voider-backup-manifest.json"))
+                self.assertEqual(manifest["format"], "gtnh-world-voider-backup-v1")
+                self.assertEqual(manifest["file_count"], 2)
+                self.assertEqual(
+                    manifest["files"]["region.dat"]["sha256"],
+                    hashlib.sha256(payload).hexdigest(),
+                )
+                self.assertEqual(archive.read("region.dat"), payload)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX record-lock test")
+    def test_write_guard_holds_session_lock_across_processes(self):
+        with tempfile.TemporaryDirectory(prefix="voider-lock-fixture-") as td:
+            world = self._world(Path(td))
+            snippet = (
+                "import pathlib,sys; import main_voider as mv; "
+                "world=pathlib.Path(sys.argv[1]); "
+                "exec('try:\\n with mv._world_write_guard(world): pass\\n'"
+                "     'except RuntimeError as exc:\\n print(exc)\\n raise SystemExit(23)'); "
+                "raise SystemExit(0)"
+            )
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(Path(mv.__file__).resolve().parent)
+            with mv._world_write_guard(world):
+                proc = subprocess.run(
+                    [sys.executable, "-c", snippet, str(world)],
+                    env=env, text=True, capture_output=True, check=False,
+                )
+            self.assertEqual(proc.returncode, 23, proc.stdout + proc.stderr)
+            self.assertIn("session.lock is locked", proc.stdout)
+
+    def test_server_instance_root_resolves_level_name_and_rejects_escape(self):
+        with tempfile.TemporaryDirectory(prefix="voider-server-layout-") as td:
+            server = Path(td) / "server"
+            world = server / "h"
+            world.mkdir(parents=True)
+            (server / "server.properties").write_text("level-name=h\n", encoding="utf-8")
+            (world / "level.dat").write_bytes(b"fixture")
+            self.assertEqual(mv._resolve_world_path(server), world.resolve())
+            (server / "server.properties").write_text("level-name=../outside\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                mv._resolve_world_path(server)
+
+    def test_biome_reset_is_backed_up_staged_and_verified(self):
+        with tempfile.TemporaryDirectory(prefix="VOIDER_HARDENING_FIXTURE_DISPOSABLE_DO_NOT_IMPORT_") as td:
+            server = Path(td) / "SERVER_INSTANCE_DO_NOT_IMPORT"
+            world = server / "h"
+            world.mkdir(parents=True)
+            (server / "server.properties").write_text("level-name=h\n", encoding="utf-8")
+            (world / "level.dat").write_bytes(b"synthetic disposable fixture")
+            raw = mv._build_void_chunk(0, 0, None, False, None, False, False, None, 1)
+            make_region(world / "region", raw)
+            changed = mv.reset_biomes(server, ["region"])
+            self.assertEqual(changed, 1)
+            self.assertTrue(mv.verify_world(world)["ok"])
+            with world.joinpath("region", "r.0.0.mca").open("rb") as fp:
+                _name, off, count = next(mv._iter_chunk_locations(fp))
+                chunk = mv._read_chunk_payload(fp, off, count)
+            level = read_level(chunk)
+            self.assertEqual(bytes(level["Biomes"].value), bytes([mv.PLAINS_ID] * 256))
+            self.assertEqual(int(level["TerrainPopulated"].value), 0)
+            self.assertEqual(int(level["LightPopulated"].value), 0)
+            backups = list(server.glob("h.void-backup-*.zip"))
+            self.assertEqual(len(backups), 1)
+            with zipfile.ZipFile(backups[0]) as archive:
+                self.assertIsNone(archive.testzip())
+                self.assertIn(".voider-backup-manifest.json", archive.namelist())
+                self.assertIn("region/r.0.0.mca", archive.namelist())
+
+    def test_biome_reset_aborts_before_commit_on_corrupt_chunk(self):
+        with tempfile.TemporaryDirectory(prefix="voider-biome-abort-") as td:
+            world = self._world(Path(td))
+            region = make_region(world / "region", b"not valid NBT")
+            original = region.read_bytes()
+            with self.assertRaisesRegex(RuntimeError, "verified backup"):
+                mv.reset_biomes(world, ["region"])
+            self.assertEqual(region.read_bytes(), original)
+            self.assertTrue(list(world.parent.glob(f"{world.name}.void-backup-*.zip")))
+            self.assertEqual(list(region.parent.glob(".*.tmp")), [])
+
+    def test_voider_worker_failure_is_reported_and_original_is_untouched(self):
+        with tempfile.TemporaryDirectory(prefix="voider-worker-failure-") as td:
+            world = self._world(Path(td))
+            region = make_region(world / "region", b"not valid NBT")
+            original = region.read_bytes()
+            with self.assertRaisesRegex(RuntimeError, "Voider did not complete"):
+                mv.run_voider(world, {}, {}, self._write_args())
+            self.assertEqual(region.read_bytes(), original)
+            backups = list(world.parent.glob(f"{world.name}.void-backup-*.zip"))
+            self.assertEqual(len(backups), 1)
+            with zipfile.ZipFile(backups[0]) as archive:
+                self.assertIsNone(archive.testzip())
+
+    def test_keep_tileentities_means_skip_not_orphan(self):
+        with tempfile.TemporaryDirectory(prefix="voider-tileentity-fixture-") as td:
+            world = self._world(Path(td))
+            raw = mv._build_void_chunk(0, 0, bytes([1] * 256), False, None,
+                                       False, False, None, 1)
+            parsed = mv.nbt.NBTFile(buffer=io.BytesIO(raw))
+            section = parsed["Level"]["Sections"][0]
+            section["Blocks"].value[0] = 1
+            tile_entities = mv.nbt.TAG_List(name="TileEntities", type=mv.nbt.TAG_Compound)
+            tile_entities.tags.append(mv.nbt.TAG_Compound())
+            parsed["Level"].tags = [
+                tag for tag in parsed["Level"].tags if getattr(tag, "name", "") != "TileEntities"
+            ]
+            parsed["Level"].tags.append(tile_entities)
+            output = io.BytesIO()
+            parsed.write_file(buffer=output)
+            region = make_region(world / "region", output.getvalue())
+            original = region.read_bytes()
+            result = mv._process_region(
+                region, dimtag="region", bbox=None, center=None, radius_blocks=0,
+                include_void=True, platform=None, keep_entities=False,
+                keep_tileentities=True, skip_if_entities=False,
+                skip_if_tileentities=False, mark_void=True, dry_run=False,
+                strict=True, sel_include=set(), sel_exclude=set(),
+                restore_biomes_from_bak=False,
+                nether_cosmetic_placeholder=False,
+            )
+            self.assertEqual(result[2], 0)
+            self.assertEqual(region.read_bytes(), original)
+
+    def test_preserve_data_preset_never_orphans_tileentities(self):
+        args = self._write_args(
+            preset="preserve-data", skip_if_entities=False,
+            skip_if_tileentities=False, keep_entities=False,
+            keep_tileentities=True, mark_void=False,
+        )
+        mv._apply_preset(args)
+        self.assertTrue(args.keep_entities)
+        self.assertTrue(args.skip_if_tileentities)
+        self.assertFalse(args.keep_tileentities)
+
+    def test_cancelled_write_stops_before_backup_or_region_change(self):
+        with tempfile.TemporaryDirectory(prefix="voider-cancel-fixture-") as td:
+            world = self._world(Path(td))
+            raw = mv._build_void_chunk(0, 0, bytes([1] * 256), True, None,
+                                       False, False, None, 1)
+            region = make_region(world / "region", raw)
+            original = region.read_bytes()
+            cancelled = __import__("threading").Event()
+            cancelled.set()
+            with self.assertRaisesRegex(InterruptedError, "already cancelled"):
+                mv.run_voider(world, {}, {}, self._write_args(), cancel_event=cancelled)
+            self.assertEqual(region.read_bytes(), original)
+            self.assertEqual(list(world.parent.glob(f"{world.name}.void-backup-*.zip")), [])
 
 
 if __name__ == "__main__":

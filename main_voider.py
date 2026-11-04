@@ -454,7 +454,7 @@ def _world_write_guard(world: Path):
             import msvcrt as lock_module
             fp.seek(0, os.SEEK_END)
             if fp.tell() == 0:
-                fp.write(b"\\0")
+                fp.write(b"\0")
                 fp.flush()
             fp.seek(0)
             try:
@@ -1913,28 +1913,39 @@ class VoiderStatusUI:
     # ---- Menu handlers ----
     def _menu_reset_all_dims(self):
         from tkinter import messagebox
-        wp=self.world_var.get().strip()
-        if not wp or not (Path(wp)/"level.dat").exists():
-            messagebox.showwarning("Pick a world","Select a valid world first.")
+        selected = self.world_var.get().strip()
+        try:
+            world = _resolve_world_path(Path(selected)) if selected else None
+        except Exception as exc:
+            messagebox.showerror("Invalid world", str(exc))
             return
+        if world is None or not (world/"level.dat").is_file():
+            messagebox.showwarning("Pick a world","Select a valid world or dedicated-server instance first.")
+            return
+        self.world_var.set(str(world))
         def run():
             self._set_status("Resetting biomes (ALL dims, provider-safe)…")
             def prog(done,total,line):
                 pct=int((done/total)*100) if total else 0
                 print(f"{pct}% — {line}")
                 self._set_progress(pct)
-            n=reset_biomes(Path(wp), None, progress_cb=prog)
+            n=reset_biomes(world, None, progress_cb=prog)
             print(f"Reset biomes in {n} chunk(s). Providers will refill on next load.")
             self._set_status("Idle.")
         threading.Thread(target=run, daemon=True).start()
 
     def _menu_reset_non_overworld(self):
         from tkinter import messagebox
-        wp=self.world_var.get().strip()
-        if not wp or not (Path(wp)/"level.dat").exists():
-            messagebox.showwarning("Pick a world","Select a valid world first.")
+        selected = self.world_var.get().strip()
+        try:
+            w = _resolve_world_path(Path(selected)) if selected else None
+        except Exception as exc:
+            messagebox.showerror("Invalid world", str(exc))
             return
-        w=Path(wp)
+        if w is None or not (w/"level.dat").is_file():
+            messagebox.showwarning("Pick a world","Select a valid world or dedicated-server instance first.")
+            return
+        self.world_var.set(str(w))
         dims=[_dim_tag(w, d) for d in _find_region_dirs(w) if _dim_tag(w,d)!="region"]
         def run():
             self._set_status("Resetting biomes (non-overworld, provider-safe)…")
@@ -1952,13 +1963,19 @@ class VoiderStatusUI:
 
     def _open_rules(self):
         from tkinter import messagebox
-        world = self.world_var.get().strip()
-        if not world or not (Path(world)/"level.dat").exists():
-            messagebox.showwarning("Pick a world", "Select a valid world first.")
+        selected = self.world_var.get().strip()
+        try:
+            world = _resolve_world_path(Path(selected)) if selected else None
+        except Exception as exc:
+            messagebox.showerror("Invalid world", str(exc))
             return
-        dims = [_dim_tag(Path(world), d) for d in _find_region_dirs(Path(world))]
-        rules = _load_rules(Path(world))
-        RulesEditorDialog(self.tk, Path(world), rules, dims, self.nei_autoload)
+        if world is None or not (world/"level.dat").is_file():
+            messagebox.showwarning("Pick a world", "Select a valid world or dedicated-server instance first.")
+            return
+        self.world_var.set(str(world))
+        dims = [_dim_tag(world, d) for d in _find_region_dirs(world)]
+        rules = _load_rules(world)
+        RulesEditorDialog(self.tk, world, rules, dims, self.nei_autoload)
 
     def _toggle_console(self):
         vis = self.console_visible.get()
@@ -1993,13 +2010,16 @@ class VoiderStatusUI:
 
     def _browse_world(self):
         from tkinter import filedialog, messagebox
-        p=filedialog.askdirectory(title="Pick a world folder (must contain level.dat)")
+        p=filedialog.askdirectory(title="Pick a world folder or dedicated-server instance")
         if p:
-            if (Path(p)/"level.dat").exists():
-                self.world_var.set(p)
-                self._prime_nei(Path(p))
-            else:
-                messagebox.showerror("Invalid world","Selected folder does not contain level.dat")
+            try:
+                world = _resolve_world_path(Path(p))
+                if not (world / "level.dat").is_file():
+                    raise ValueError("Selected folder has neither level.dat nor a valid server.properties level-name world.")
+                self.world_var.set(str(world))
+                self._prime_nei(world)
+            except Exception as exc:
+                messagebox.showerror("Invalid world", str(exc))
 
     def _discover_worlds(self):
         def bg():
@@ -2043,10 +2063,8 @@ class VoiderStatusUI:
     def _start_voiding(self):
         if self.worker_thread and self.worker_thread.is_alive(): return
         wp=self.world_var.get().strip()
-        if not wp or not (Path(wp)/"level.dat").exists():
-            self._set_status("Pick a valid world first."); return
         try:
-            wp = str(_resolve_world_path(Path(wp)))
+            wp = str(_resolve_world_path(Path(wp))) if wp else ""
         except Exception as exc:
             self._set_status(f"Invalid world: {exc}")
             return
@@ -2490,6 +2508,11 @@ def main()->bool:
 
     args=ap.parse_args()
     _apply_preset(args)
+    if args.world:
+        try:
+            args.world = str(_resolve_world_path(Path(args.world)))
+        except Exception as exc:
+            ap.error(str(exc))
 
     if args.inspect_world:
         if not args.world: ap.error("--inspect-world requires a world path")
