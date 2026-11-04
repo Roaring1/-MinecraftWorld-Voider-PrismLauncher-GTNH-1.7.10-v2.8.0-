@@ -419,28 +419,39 @@ def _assert_world_not_active(world:Path) -> None:
     if status == "unknown":
         raise RuntimeError(f"Cannot safely establish that the world is offline: {detail}")
 
+_WORLD_WRITE_LOCKS_GUARD = threading.Lock()
+_WORLD_WRITE_LOCKS: Dict[str, threading.Lock] = {}
+
+
 @contextmanager
 def _world_write_guard(world: Path):
-    """Hold Minecraft's session.lock for the full backup-and-write transaction.
+    """Serialize in-process writers and hold Minecraft's OS session lock.
 
-    A point-in-time lock probe is not enough: Minecraft could start immediately
-    after the probe. Keeping the OS record lock held prevents a concurrent
-    Minecraft/Java server process from acquiring the same session.lock.
+    POSIX record locks are process-scoped, so they do not serialize two
+    threads in the same Python process. The per-world mutex closes that gap;
+    the OS lock coordinates with Minecraft and other applications.
     """
     world = Path(world).expanduser().resolve()
     if not world.is_dir() or not (world / "level.dat").is_file():
         raise ValueError(f"Not a Minecraft world folder: {world}")
-    lock_path = world / "session.lock"
-    if lock_path.is_symlink():
-        raise RuntimeError(f"Refusing symlinked session.lock: {lock_path}")
-    flags = os.O_RDWR | os.O_CREAT
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(str(lock_path), flags, 0o600)
-    fp = os.fdopen(fd, "r+b")
+    key = os.path.normcase(str(world))
+    with _WORLD_WRITE_LOCKS_GUARD:
+        local_lock = _WORLD_WRITE_LOCKS.setdefault(key, threading.Lock())
+    if not local_lock.acquire(blocking=False):
+        raise RuntimeError(f"Another Voider write or biome reset is already running for {world}")
+
+    fp = None
     locked = False
     lock_module = None
     try:
+        lock_path = world / "session.lock"
+        if lock_path.is_symlink():
+            raise RuntimeError(f"Refusing symlinked session.lock: {lock_path}")
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(str(lock_path), flags, 0o600)
+        fp = os.fdopen(fd, "r+b")
         if os.name == "posix":
             import fcntl as lock_module
             try:
@@ -468,16 +479,18 @@ def _world_write_guard(world: Path):
             raise RuntimeError(f"Safe world-write locking is unsupported on {os.name!r}; refusing to write.")
         yield
     finally:
-        if locked and lock_module is not None:
-            try:
-                if os.name == "posix":
-                    lock_module.lockf(fp.fileno(), lock_module.LOCK_UN, 1, 0, os.SEEK_SET)
-                else:
-                    fp.seek(0)
-                    lock_module.locking(fp.fileno(), lock_module.LK_UNLCK, 1)
-            except OSError:
-                pass
-        fp.close()
+        if fp is not None:
+            if locked and lock_module is not None:
+                try:
+                    if os.name == "posix":
+                        lock_module.lockf(fp.fileno(), lock_module.LOCK_UN, 1, 0, os.SEEK_SET)
+                    else:
+                        fp.seek(0)
+                        lock_module.locking(fp.fileno(), lock_module.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            fp.close()
+        local_lock.release()
 
 # ---------------- Biomes / flags ----------------
 def _nbt_from_raw(raw:bytes) -> Optional[nbt.NBTFile]:
@@ -1027,20 +1040,25 @@ def _process_region(mca:Path, *args, **kwargs)->Tuple[str,int,int]:
     temp = mca.with_name(f".{mca.name}.voider-{os.getpid()}-{threading.get_ident()}.tmp")
     try:
         before = mca.stat()
-        source_signature = (before.st_size, before.st_mtime_ns)
+        source_signature = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
         if temp.exists():
             temp.unlink()
         shutil.copy2(mca, temp)
         work_kwargs = dict(kwargs)
         work_kwargs["_region_coords"] = coords
         work_kwargs["_source_region"] = mca
+        copied = mca.stat()
+        copied_signature = (copied.st_dev, copied.st_ino, copied.st_size, copied.st_mtime_ns)
+        if copied_signature != source_signature:
+            raise RuntimeError(f"Region changed while its working copy was being prepared: {mca}")
         _tmp_name, scanned, changed = _process_region_inplace(temp, *args, **work_kwargs)
         active_cancel = work_kwargs.get("cancel_event")
         if active_cancel is not None and active_cancel.is_set():
             raise InterruptedError(f"Cancelled before committing region {mca.name}")
         if changed:
             current = mca.stat()
-            if (current.st_size, current.st_mtime_ns) != source_signature:
+            current_signature = (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+            if current_signature != source_signature:
                 raise RuntimeError(f"Region changed concurrently; refusing replacement: {mca}")
             os.replace(temp, mca)
             _fsync_directory(mca.parent)
@@ -1245,7 +1263,7 @@ def reset_biomes(world: Path, dims: Optional[List[str]] = None, *, progress_cb=N
     if not world.is_dir() or not (world / "level.dat").is_file():
         raise ValueError(f"Not a Minecraft world folder: {world}")
     region_dirs = _find_region_dirs(world)
-    requested = {item.strip() for item in dims} if dims else None
+    requested = {item.strip() for item in dims} if dims is not None else None
     if requested is not None:
         available = {_dim_tag(world, directory) for directory in region_dirs}
         unknown = requested - available
@@ -1492,6 +1510,10 @@ def verify_world(world:Path)->Dict[str, object]:
                 with mca.open("rb") as fp:
                     offsets, _ = _read_header(fp)
                     fp.seek(0, os.SEEK_END); file_size = fp.tell()
+                    if file_size < 2 * SECTOR_BYTES or file_size % SECTOR_BYTES:
+                        file_errors.append(
+                            f"{mca.name}: region file size is not a positive whole number of sectors: {file_size}"
+                        )
                     occupied: Set[int] = set()
                     for idx, entry in enumerate(offsets):
                         if not entry: continue
@@ -1579,7 +1601,8 @@ class HelpDialog:
         "Options (hover for short; hold Shift while hovering for more details & examples):\n"
         " • Dry run — Does NOT write files. Shows how many chunks would be voided.\n"
         " • Include already void — Also rewrites chunks that are already empty.\n"
-        " • Keep Entities/TileEntities — Preserve from source chunk.\n"
+        " • Keep Entities — Copy entity records to the new chunk.\n"
+        " • Keep TileEntities — Leave any chunk containing TileEntities untouched.\n"
         " • Skip if Entities/TileEntities — Skip chunks that contain any.\n"
         " • Mark Void tag — Adds Level.Voider=1 to new chunks.\n"
         " • Restore Biomes from .bak — If Biomes are missing, try copying from .mca.bak.\n"
@@ -1915,52 +1938,84 @@ class VoiderStatusUI:
         self._pump()
 
     # ---- Menu handlers ----
+    def _run_biome_reset(self, world: Path, dims: Optional[List[str]], description: str):
+        from tkinter import messagebox
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showwarning("Operation already running", "Wait for the current world operation to finish.")
+            return
+        if dims is not None and not dims:
+            messagebox.showinfo("No dimensions", "There are no non-Overworld dimensions to reset.")
+            return
+        scope = "all detected dimensions" if dims is None else ", ".join(dims)
+        approved = messagebox.askyesno(
+            "Confirm biome reset",
+            f"{description}\n\nWorld: {world}\nScope: {scope}\n\n"
+            "This changes chunk biome/population metadata. A full verified ZIP backup "
+            "will be created first. The Minecraft client/server must be stopped. Continue?",
+            parent=self.tk,
+        )
+        if not approved:
+            return
+
+        self.btn_start.configure(state="disabled")
+        self.btn_cancel.configure(state="disabled")
+        self._set_status("Preparing biome reset and verified backup…")
+
+        def run():
+            try:
+                def progress(done, total, line):
+                    pct = int((done / total) * 100) if total else 0
+                    print(f"{pct}% — {line}")
+                    self._set_progress(pct)
+                    self._set_status(f"{description}: {pct}% — {line}")
+
+                count = reset_biomes(world, dims, progress_cb=progress)
+                print(f"Biome reset complete: changed {count} chunk(s).")
+                self._set_status(f"Biome reset complete: {count} chunk(s) changed.")
+            except Exception as exc:
+                print(f"[error] Biome reset failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+                self._set_status(f"Biome reset failed: {exc}")
+            finally:
+                def restore_controls():
+                    self.btn_start.configure(state="normal")
+                    self.btn_cancel.configure(state="disabled")
+                self._ui_call(restore_controls)
+
+        self.worker_thread = threading.Thread(target=run, daemon=True)
+        self.worker_thread.start()
+
     def _menu_reset_all_dims(self):
         from tkinter import messagebox
         selected = self.world_var.get().strip()
         try:
             world = _resolve_world_path(Path(selected)) if selected else None
         except Exception as exc:
-            messagebox.showerror("Invalid world", str(exc))
+            messagebox.showerror("Invalid world", str(exc), parent=self.tk)
             return
-        if world is None or not (world/"level.dat").is_file():
-            messagebox.showwarning("Pick a world","Select a valid world or dedicated-server instance first.")
+        if world is None or not (world / "level.dat").is_file():
+            messagebox.showwarning("Pick a world", "Select a valid world or dedicated-server instance first.", parent=self.tk)
             return
         self.world_var.set(str(world))
-        def run():
-            self._set_status("Resetting biomes (ALL dims, provider-safe)…")
-            def prog(done,total,line):
-                pct=int((done/total)*100) if total else 0
-                print(f"{pct}% — {line}")
-                self._set_progress(pct)
-            n=reset_biomes(world, None, progress_cb=prog)
-            print(f"Reset biomes in {n} chunk(s). Providers will refill on next load.")
-            self._set_status("Idle.")
-        threading.Thread(target=run, daemon=True).start()
+        self._run_biome_reset(world, None, "Reset biome metadata in all dimensions")
 
     def _menu_reset_non_overworld(self):
         from tkinter import messagebox
         selected = self.world_var.get().strip()
         try:
-            w = _resolve_world_path(Path(selected)) if selected else None
+            world = _resolve_world_path(Path(selected)) if selected else None
         except Exception as exc:
-            messagebox.showerror("Invalid world", str(exc))
+            messagebox.showerror("Invalid world", str(exc), parent=self.tk)
             return
-        if w is None or not (w/"level.dat").is_file():
-            messagebox.showwarning("Pick a world","Select a valid world or dedicated-server instance first.")
+        if world is None or not (world / "level.dat").is_file():
+            messagebox.showwarning("Pick a world", "Select a valid world or dedicated-server instance first.", parent=self.tk)
             return
-        self.world_var.set(str(w))
-        dims=[_dim_tag(w, d) for d in _find_region_dirs(w) if _dim_tag(w,d)!="region"]
-        def run():
-            self._set_status("Resetting biomes (non-overworld, provider-safe)…")
-            def prog(done,total,line):
-                pct=int((done/total)*100) if total else 0
-                print(f"{pct}% — {line}")
-                self._set_progress(pct)
-            n=reset_biomes(w, dims, progress_cb=prog)
-            print(f"Reset biomes in {n} chunk(s). Providers will refill on next load.")
-            self._set_status("Idle.")
-        threading.Thread(target=run, daemon=True).start()
+        self.world_var.set(str(world))
+        dims = [
+            _dim_tag(world, directory)
+            for directory in _find_region_dirs(world)
+            if _dim_tag(world, directory) != "region"
+        ]
+        self._run_biome_reset(world, dims, "Reset biome metadata outside the Overworld")
 
     # ---- Buttons / actions ----
     def _open_help(self): HelpDialog(self.tk)
@@ -2157,6 +2212,9 @@ class VoiderStatusUI:
                        if self.args.dry_run else
                        f"Done. Voided {total_changed} chunk(s) out of {total_scanned} scanned. Biomes provider-safe.")
                 print(msg); self._set_status("Idle.")
+            except Exception as exc:
+                print(f"[error] Voider operation failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+                self._set_status(f"Voider operation failed: {exc}")
             finally:
                 self._set_running(False)
 
