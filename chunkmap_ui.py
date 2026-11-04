@@ -610,17 +610,25 @@ class JMTileSource:
         return None
 
 # ---------- Biomes rule scan (optional “Select by Biome ID rule…”) ----------
-def _get_chunk_biomes(raw: bytes) -> Optional[bytes]:
+def _get_chunk_biomes(raw: bytes) -> Optional[Set[int]]:
+    """Read legacy 8-bit IDs and GTNH's 16-bit little-endian Biomes16v2."""
     try:
         from nbt import nbt
         nb = nbt.NBTFile(buffer=__import__("io").BytesIO(raw))
         lvl = nb["Level"]
+        ids: Set[int] = set()
         if "Biomes" in lvl and isinstance(lvl["Biomes"], nbt.TAG_Byte_Array):
-            b = bytes(lvl["Biomes"].value)
-            if len(b) == 256: return b
+            data = bytes(lvl["Biomes"].value)
+            if len(data) == 256:
+                ids.update(data)
+        if "Biomes16v2" in lvl and isinstance(lvl["Biomes16v2"], nbt.TAG_Byte_Array):
+            data = bytes(lvl["Biomes16v2"].value)
+            if len(data) == 512:
+                ids.update(data[index] | (data[index + 1] << 8)
+                           for index in range(0, len(data), 2))
+        return ids or None
     except Exception:
-        pass
-    return None
+        return None
 
 def _read_chunk_payload(fp, sector_off:int) -> Optional[bytes]:
     fp.seek(sector_off * SECTOR_BYTES)
@@ -655,7 +663,7 @@ def _chunks_matching_biomes(mca: Path, wanted: Set[int]) -> Set[Tuple[int,int]]:
                 if not raw: continue
                 bio = _get_chunk_biomes(raw)
                 if not bio: continue
-                if any(b in wanted for b in bio):
+                if bio & wanted:
                     cx_local = idx % 32
                     cz_local = idx // 32
                     cx_abs   = rx*32 + cx_local
@@ -1569,7 +1577,7 @@ class ChunkMapWindow(tk.Toplevel):
 
     def _select_by_biome_rule(self):
         dlg = tk.Toplevel(self); dlg.title("Select by Biome ID")
-        ttk.Label(dlg, text="Biome IDs (0..255), comma-separated:").pack(anchor="w", padx=10, pady=(10,4))
+        ttk.Label(dlg, text="Biome IDs (0..65535), comma-separated:").pack(anchor="w", padx=10, pady=(10,4))
         ent = ttk.Entry(dlg, width=48); ent.pack(fill="x", padx=10); ent.focus_set()
         mode_var = tk.StringVar(value="include")
         frm = ttk.Frame(dlg); frm.pack(fill="x", padx=10, pady=6)
@@ -1584,9 +1592,9 @@ class ChunkMapWindow(tk.Toplevel):
         raw = ent.get().strip()
         try:
             wanted = {int(x.strip()) for x in raw.split(",") if x.strip() != ""}
-            wanted = {x for x in wanted if 0 <= x <= 255}
+            wanted = {x for x in wanted if 0 <= x <= 65535}
         except Exception:
-            messagebox.showerror("Bad input", "Enter integers 0..255 separated by commas.")
+            messagebox.showerror("Bad input", "Enter integers 0..65535 separated by commas.")
             return
         if not wanted: return
         label = self.dim_combo.get()

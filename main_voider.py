@@ -512,6 +512,30 @@ def _get_biomes(raw:bytes) -> Optional[bytes]:
         pass
     return None
 
+
+def _get_biome_ids(raw: bytes) -> Set[int]:
+    """Read both vanilla 8-bit Biomes and GTNH's 16-bit Biomes16v2 arrays."""
+    nb = _nbt_from_raw(raw)
+    if nb is None or "Level" not in nb:
+        return set()
+    level = nb["Level"]
+    biome_ids: Set[int] = set()
+    try:
+        standard = level.get("Biomes")
+        if isinstance(standard, nbt.TAG_Byte_Array) and len(standard.value) == 256:
+            biome_ids.update(int(value) & 0xFF for value in standard.value)
+        extended = level.get("Biomes16v2")
+        if isinstance(extended, nbt.TAG_Byte_Array):
+            data = bytes(extended.value)
+            if len(data) == 512:
+                biome_ids.update(
+                    data[index] | (data[index + 1] << 8)
+                    for index in range(0, len(data), 2)
+                )
+    except Exception:
+        return set()
+    return biome_ids
+
 def _has_entities(raw:bytes) -> Tuple[bool,bool]:
     nb = _nbt_from_raw(raw)
     if not nb: return (False, False)
@@ -586,9 +610,9 @@ def _iter_blocks_17(raw:bytes):
                     yield (lx, lz, base_y, full, meta)
 
 def _chunk_has_biome_id(raw:bytes, wanted:Set[int])->bool:
-    b=_get_biomes(raw)
-    if not b: return False
-    return any(x in wanted for x in b)
+    if not wanted:
+        return False
+    return bool(_get_biome_ids(raw) & wanted)
 
 def _chunk_entities_flags(raw:bytes, allow:Set[str], deny:Set[str])->Tuple[bool,bool]:
     nb = _nbt_from_raw(raw)
@@ -765,21 +789,47 @@ def _build_void_chunk(
     source_raw: Optional[bytes],
     populated_flag: int = 1,
 ) -> bytes:
-    ents  = nbt.TAG_List(name="Entities",      type=nbt.TAG_Compound)
-    tiles = nbt.TAG_List(name="TileEntities",  type=nbt.TAG_Compound)
-    ticks = nbt.TAG_List(name="TileTicks",     type=nbt.TAG_Compound)
+    ents = nbt.TAG_List(name="Entities", type=nbt.TAG_Compound)
+    tiles = nbt.TAG_List(name="TileEntities", type=nbt.TAG_Compound)
+    ticks = nbt.TAG_List(name="TileTicks", type=nbt.TAG_Compound)
+    biome16_tag = None
+    extra_level_tags = []
+    extra_root_tags = []
 
-    if source_raw and keep_entities:
+    if source_raw:
         try:
             src = nbt.NBTFile(buffer=io.BytesIO(source_raw))
-            lvl = src["Level"]
-            if "Entities" in lvl and isinstance(lvl["Entities"], nbt.TAG_List):
-                ents = lvl["Entities"]
+            source_level = src["Level"]
+            if keep_entities and "Entities" in source_level:
+                if not isinstance(source_level["Entities"], nbt.TAG_List):
+                    raise ValueError("Level.Entities has an unexpected NBT type")
+                ents = copy.deepcopy(source_level["Entities"])
+            if "Biomes16v2" in source_level:
+                candidate = source_level["Biomes16v2"]
+                if not isinstance(candidate, nbt.TAG_Byte_Array) or len(candidate.value) != 512:
+                    raise ValueError("Level.Biomes16v2 must be a 512-byte array")
+                biome16_tag = copy.deepcopy(candidate)
+
+            # GTNH 1.7.10 stores mod-owned chunk metadata such as POSTEA and V
+            # directly under Level. Keep all unknown tags verbatim; replace
+            # only fields whose meaning depends on the terrain being removed.
+            rewritten_names = {
+                "xPos", "zPos", "LastUpdate", "InhabitedTime",
+                "TerrainPopulated", "LightPopulated", "Populated",
+                "HeightMap", "Biomes", "Biomes16v2", "Entities",
+                "TileEntities", "TileTicks", "Sections", "Voider",
+            }
+            for tag in source_level.tags:
+                if getattr(tag, "name", "") not in rewritten_names:
+                    extra_level_tags.append(copy.deepcopy(tag))
+            for tag in src.tags:
+                if getattr(tag, "name", "") != "Level":
+                    extra_root_tags.append(copy.deepcopy(tag))
         except Exception as exc:
-            raise ValueError(f"Cannot preserve entities from an unreadable source chunk: {exc}") from exc
-    # TileEntities and TileTicks reference blocks that this operation removes.
-    # They must not be copied into a terrain-free chunk; the caller protects
-    # those chunks by skipping them when keep_tileentities is selected.
+            raise ValueError(f"Cannot safely preserve source chunk metadata: {exc}") from exc
+    # TileEntities and TileTicks refer to blocks that this operation removes.
+    # They are never copied into terrain-free chunks; the caller skips the
+    # entire chunk when the user asks to keep TileEntity-bearing chunks intact.
 
     root = nbt.NBTFile()
     lvl  = nbt.TAG_Compound(name="Level")
@@ -862,6 +912,11 @@ def _build_void_chunk(
                                 sections[secY].tags.append(add_tag)
                                 sec_add[secY] = add_tag
                             _nibble_set(sec_add[secY].value, idx, high)
+
+    outb = io.BytesIO()
+    root.write_file(buffer=outb)
+    return outb.getvalue()
+                 _nibble_set(sec_add[secY].value, idx, high)
 
     outb = io.BytesIO()
     root.write_file(buffer=outb)
@@ -1229,14 +1284,25 @@ def _reset_biomes_region_inplace(mca: Path, tag: str, rx: int, rz: int) -> int:
                 current = None
                 if "Biomes" in level and isinstance(level["Biomes"], nbt.TAG_Byte_Array):
                     current = bytes(level["Biomes"].value)
-                if current is not None and len(current) == 256:
+                extended = level.get("Biomes16v2")
+                has_extended = (
+                    isinstance(extended, nbt.TAG_Byte_Array)
+                    and len(extended.value) == 512
+                )
+                if (current is not None and len(current) == 256) or has_extended:
                     continue
-                level.tags = [item for item in level.tags if getattr(item, "name", "") != "Biomes"]
+                level.tags = [
+                    item for item in level.tags
+                    if getattr(item, "name", "") not in {"Biomes", "Biomes16v2"}
+                ]
                 biome_tag = nbt.TAG_Byte_Array(name="Biomes")
                 biome_tag.value = [PLAINS_ID] * 256
                 level.tags.append(biome_tag)
             else:
-                level.tags = [item for item in level.tags if getattr(item, "name", "") != "Biomes"]
+                level.tags = [
+                    item for item in level.tags
+                    if getattr(item, "name", "") not in {"Biomes", "Biomes16v2"}
+                ]
 
             reset_names = {"TerrainPopulated", "LightPopulated", "Populated", "HeightMap", "InhabitedTime"}
             level.tags = [item for item in level.tags if getattr(item, "name", "") not in reset_names]
