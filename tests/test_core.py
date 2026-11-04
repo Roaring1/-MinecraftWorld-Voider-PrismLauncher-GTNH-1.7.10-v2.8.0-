@@ -9,6 +9,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 from argparse import Namespace
 from pathlib import Path
@@ -510,6 +511,66 @@ class HardeningRegressionTests(unittest.TestCase):
             self.assertEqual(region.read_bytes(), original)
             self.assertEqual(list(world.parent.glob(f"{world.name}.void-backup-*.zip")), [])
 
+
+
+    def test_write_guard_rejects_same_process_reentrancy(self):
+        with tempfile.TemporaryDirectory(prefix="voider-thread-lock-") as td:
+            world = self._world(Path(td))
+            with mv._world_write_guard(world):
+                with self.assertRaisesRegex(RuntimeError, "already running"):
+                    with mv._world_write_guard(world):
+                        self.fail("nested same-process writer must never enter")
+
+    def test_empty_biome_dimension_list_does_not_expand_to_all(self):
+        with tempfile.TemporaryDirectory(prefix="voider-empty-dims-") as td:
+            world = self._world(Path(td))
+            raw = mv._build_void_chunk(0, 0, None, False, None, False, False, None, 1)
+            region = make_region(world / "region", raw)
+            original = region.read_bytes()
+            with self.assertRaisesRegex(RuntimeError, "No region files"):
+                mv.reset_biomes(world, [])
+            self.assertEqual(region.read_bytes(), original)
+            self.assertEqual(list(world.parent.glob(f"{world.name}.void-backup-*.zip")), [])
+
+    def test_biome_reset_rolls_back_committed_regions_when_postverify_fails(self):
+        with tempfile.TemporaryDirectory(prefix="voider-biome-rollback-") as td:
+            world = self._world(Path(td))
+            region = make_region(
+                world / "region",
+                mv._build_void_chunk(0, 0, None, False, None, False, False, None, 1),
+                rx=0,
+                rz=0,
+                idx=0,
+            )
+            original = region.read_bytes()
+            with mock.patch.object(
+                mv, "verify_world",
+                return_value={"ok": False, "errors": ["synthetic verifier rejection"]},
+            ):
+                with self.assertRaisesRegex(RuntimeError, "rolled back"):
+                    mv.reset_biomes(world, ["region"])
+            self.assertEqual(region.read_bytes(), original)
+            self.assertEqual(list(region.parent.glob(".*.voider-rollback-*")), [])
+            backups = list(world.parent.glob(f"{world.name}.void-backup-*.zip"))
+            self.assertEqual(len(backups), 1)
+            with zipfile.ZipFile(backups[0]) as archive:
+                self.assertIsNone(archive.testzip())
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "Symlinks unsupported")
+    def test_backup_refuses_symlinks_in_world_tree(self):
+        with tempfile.TemporaryDirectory(prefix="voider-symlink-backup-") as td:
+            root = Path(td)
+            world = self._world(root)
+            outside = root / "outside.txt"
+            outside.write_text("must not be followed", encoding="utf-8")
+            link = world / "external-link.txt"
+            try:
+                link.symlink_to(outside)
+            except (OSError, NotImplementedError):
+                self.skipTest("Filesystem does not permit symlink creation")
+            with self.assertRaisesRegex(RuntimeError, "symlinked file"):
+                mv._backup_world_zip(world)
+            self.assertEqual(list(root.glob(f"{world.name}.void-backup-*.zip")), [])
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
