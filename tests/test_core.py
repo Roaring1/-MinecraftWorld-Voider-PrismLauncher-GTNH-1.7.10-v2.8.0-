@@ -669,5 +669,73 @@ class HardeningRegressionTests(unittest.TestCase):
             with zipfile.ZipFile(backups[0]) as archive:
                 self.assertIsNone(archive.testzip())
 
+
+    def test_gtnh_biomes16v2_prevents_legacy_plains_fallback(self):
+        source = mv._build_void_chunk(0, 0, None, False, None,
+                                     False, False, None, 1)
+        root = mv.nbt.NBTFile(buffer=io.BytesIO(source))
+        biome16 = mv.nbt.TAG_Byte_Array(name="Biomes16v2")
+        biome16.value = [0] * 512
+        biome16.value[0] = 0x34
+        biome16.value[1] = 0x12
+        expected = bytes(biome16.value)
+        root["Level"].tags.append(biome16)
+        stream = io.BytesIO()
+        root.write_file(buffer=stream)
+
+        rewritten = mv._build_void_chunk(
+            0, 0, bytes([mv.PLAINS_ID] * 256), True, None,
+            False, False, stream.getvalue(), 1,
+        )
+        rewritten_level = read_level(rewritten)
+        self.assertNotIn("Biomes", rewritten_level)
+        self.assertEqual(bytes(rewritten_level["Biomes16v2"].value), expected)
+
+    def test_restore_biomes16v2_from_region_backup(self):
+        with tempfile.TemporaryDirectory(prefix="voider-biomes16-restore-") as td:
+            world = self._world(Path(td))
+            original = mv._build_void_chunk(
+                0, 0, None, False, None, False, False, None, 1,
+            )
+            region = make_region(world / "region", original)
+
+            backup_root = Path(td) / "backup"
+            backup_raw = mv._build_void_chunk(
+                0, 0, None, False, None, False, False, None, 1,
+            )
+            backup_nbt = mv.nbt.NBTFile(buffer=io.BytesIO(backup_raw))
+            biome16 = mv.nbt.TAG_Byte_Array(name="Biomes16v2")
+            biome16.value = [0] * 512
+            for index in range(0, 512, 2):
+                biome16.value[index] = 0xC8
+                biome16.value[index + 1] = 0x01
+            expected = bytes(biome16.value)
+            backup_nbt["Level"].tags.append(biome16)
+            backup_stream = io.BytesIO()
+            backup_nbt.write_file(buffer=backup_stream)
+            backup_region = make_region(backup_root / "region", backup_stream.getvalue())
+            region.with_suffix(region.suffix + ".bak").write_bytes(backup_region.read_bytes())
+
+            self.assertEqual(
+                mv._copy_biomes16v2_from_backup_if_available(region, 0),
+                expected,
+            )
+            result = mv._process_region(
+                region, dimtag="region", bbox=None, center=None, radius_blocks=0,
+                include_void=True, platform=None, keep_entities=False,
+                keep_tileentities=False, skip_if_entities=False,
+                skip_if_tileentities=False, mark_void=True, dry_run=False,
+                strict=True, sel_include=set(), sel_exclude=set(),
+                restore_biomes_from_bak=True,
+                nether_cosmetic_placeholder=False,
+            )
+            self.assertEqual(result[2], 1)
+            with region.open("rb") as fp:
+                _name, off, count = next(mv._iter_chunk_locations(fp))
+                rewritten = mv._read_chunk_payload(fp, off, count)
+            level = read_level(rewritten)
+            self.assertNotIn("Biomes", level)
+            self.assertEqual(bytes(level["Biomes16v2"].value), expected)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

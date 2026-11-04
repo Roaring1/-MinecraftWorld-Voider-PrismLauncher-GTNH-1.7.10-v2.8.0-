@@ -513,6 +513,20 @@ def _get_biomes(raw:bytes) -> Optional[bytes]:
     return None
 
 
+def _get_biomes16v2(raw: bytes) -> Optional[bytes]:
+    """Return GTNH's 256-entry little-endian u16 biome array, if valid."""
+    nb = _nbt_from_raw(raw)
+    if nb is None or "Level" not in nb:
+        return None
+    try:
+        tag = nb["Level"].get("Biomes16v2")
+        if isinstance(tag, nbt.TAG_Byte_Array) and len(tag.value) == 512:
+            return bytes(tag.value)
+    except Exception:
+        pass
+    return None
+
+
 def _get_biome_ids(raw: bytes) -> Set[int]:
     """Read both vanilla 8-bit Biomes and GTNH's 16-bit Biomes16v2 arrays."""
     nb = _nbt_from_raw(raw)
@@ -788,6 +802,7 @@ def _build_void_chunk(
     keep_tileentities: bool,
     source_raw: Optional[bytes],
     populated_flag: int = 1,
+    biome16_bytes: Optional[bytes] = None,
 ) -> bytes:
     """Build a terrain-free 1.7.10 chunk while retaining non-terrain mod metadata."""
     entities = nbt.TAG_List(name="Entities", type=nbt.TAG_Compound)
@@ -827,6 +842,12 @@ def _build_void_chunk(
         except Exception as exc:
             raise ValueError(f"Cannot safely preserve source chunk metadata: {exc}") from exc
 
+    if biome16_bytes is not None:
+        if len(biome16_bytes) != 512:
+            raise ValueError("Biomes16v2 override must contain exactly 512 bytes")
+        biome16_tag = nbt.TAG_Byte_Array(name="Biomes16v2")
+        biome16_tag.value = list(biome16_bytes)
+
     root = nbt.NBTFile()
     level = nbt.TAG_Compound(name="Level")
     root.tags.append(level)
@@ -845,7 +866,9 @@ def _build_void_chunk(
     heightmap.value = [0] * 256
     level.tags.append(heightmap)
 
-    if biome_bytes is not None and len(biome_bytes) == 256:
+    # GTNH's 16-bit array is authoritative when present. Do not add a
+    # contradictory vanilla Plains/Hell fallback alongside Biomes16v2.
+    if biome16_tag is None and biome_bytes is not None and len(biome_bytes) == 256:
         biome_tag = nbt.TAG_Byte_Array(name="Biomes")
         biome_tag.value = list(biome_bytes)
         level.tags.append(biome_tag)
@@ -947,6 +970,27 @@ def _copy_biomes_from_backup_if_available(region_path:Path, idx:int)->Optional[b
     if not bak.exists(): return None
     return _read_biomes_from_region(bak, idx)
 
+
+def _read_biomes16v2_from_region(region_path: Path, idx: int) -> Optional[bytes]:
+    try:
+        with region_path.open("rb") as fp:
+            offsets, _ = _read_header(fp)
+            entry = offsets[idx]
+            if entry == 0:
+                return None
+            off, count = _parse_loc(entry)
+            raw = _read_chunk_payload(fp, off, count)
+            return _get_biomes16v2(raw) if raw else None
+    except Exception:
+        return None
+
+
+def _copy_biomes16v2_from_backup_if_available(region_path: Path, idx: int) -> Optional[bytes]:
+    backup = region_path.with_suffix(region_path.suffix + ".bak")
+    if not backup.is_file():
+        return None
+    return _read_biomes16v2_from_region(backup, idx)
+
 # ---------------- Filters ----------------
 def _bbox_ok(cx_abs:int, cz_abs:int, bbox:Optional[Tuple[int,int,int,int]])->bool:
     if not bbox: return True
@@ -1039,24 +1083,37 @@ def _process_region_inplace(mca:Path, dimtag:str, bbox, center, radius_blocks:in
             if already_void and not platform_needed and not include_void:
                 continue
 
-            # Biome policy for writing the new chunk:
+            # Preserve GTNH's 16-bit biome array when present. Restore it
+            # from .mca.bak when requested and missing in the source chunk.
+            biome16_src = _get_biomes16v2(raw)
+            if biome16_src is None and restore_biomes_from_bak:
+                biome16_src = _copy_biomes16v2_from_backup_if_available(_source_region or mca, idx)
+
             biome_src = _get_biomes(raw)
-            if biome_src is None and restore_biomes_from_bak:
+            if biome_src is None and biome16_src is None and restore_biomes_from_bak:
                 biome_src = _copy_biomes_from_backup_if_available(_source_region or mca, idx)
 
             if dimtag == "region":
-                # Overworld: write Plains(1) if missing; otherwise keep existing biomes
-                biome_bytes_to_write = biome_src if (biome_src is not None and len(biome_src)==256) else bytes([PLAINS_ID]*256)
-            else:
-                # Non-overworld: preserve if present; if missing normally omit so providers refill.
-                # Cosmetic: in Nether, optionally prefill with Hell to avoid "Ocean" HUD before repopulation.
-                if biome_src is not None and len(biome_src)==256:
-                    biome_bytes_to_write = biome_src
+                # Overworld: preserve either existing biome representation;
+                # write Plains(1) only when neither representation exists.
+                if biome16_src is not None:
+                    biome_bytes_to_write = None
                 else:
-                    if nether_cosmetic_placeholder and dimtag.startswith("DIM-1/"):
-                        biome_bytes_to_write = bytes([HELL_ID]*256)
-                    else:
-                        biome_bytes_to_write = None  # provider will recompute
+                    biome_bytes_to_write = (
+                        biome_src if (biome_src is not None and len(biome_src) == 256)
+                        else bytes([PLAINS_ID] * 256)
+                    )
+            else:
+                # Non-overworld: preserve either representation; if both are
+                # missing, normally omit so the provider can recompute.
+                if biome16_src is not None:
+                    biome_bytes_to_write = None
+                elif biome_src is not None and len(biome_src) == 256:
+                    biome_bytes_to_write = biome_src
+                elif nether_cosmetic_placeholder and dimtag.startswith("DIM-1/"):
+                    biome_bytes_to_write = bytes([HELL_ID] * 256)
+                else:
+                    biome_bytes_to_write = None
 
             if dry_run:
                 changed += 1
@@ -1065,7 +1122,7 @@ def _process_region_inplace(mca:Path, dimtag:str, bbox, center, radius_blocks:in
             new = _build_void_chunk(cx_abs, cz_abs, biome_bytes_to_write, mark_void,
                         platform if platform_needed else None,
                         keep_entities, keep_tileentities, raw,
-                        pop_flag)
+                        pop_flag, biome16_src)
             new_off, new_cnt = _write_chunk_payload(fp, off, cnt, new)
             _update_header(fp, idx, new_off, new_cnt)
             changed += 1
