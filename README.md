@@ -6,7 +6,6 @@ A safety-first chunk voiding and biome-maintenance tool for Minecraft 1.7.x worl
 
 - **Dry run is the default.** Writing requires `--write` or unchecking **Dry run** in the GUI.
 - **A complete, verified world ZIP is the default before writes.** The archive includes a per-file SHA-256 manifest, CRC verification, and a stable world-inventory check. Use `--no-backup` only when you deliberately accept the recovery risk.
-- The transient root `session.lock` file is intentionally excluded from backups; it is an OS coordination lock, not world content, and must be recreated rather than restored.
 - The tool holds a per-world in-process mutex and the operating-system lock on `session.lock` for the entire backup/write transaction. If safe locking cannot be established, writing fails closed.
 - Region edits are made in temporary copies and atomically replaced only after the chunk pass succeeds and the source file's device, inode, size, and modification time still match.
 - Malformed chunk NBT, coordinate mismatches, and region-worker failures abort the run instead of being reported as successful skips. Cancellation prevents a working region copy from being committed; earlier region commits remain recoverable from the verified ZIP.
@@ -18,6 +17,8 @@ A safety-first chunk voiding and biome-maintenance tool for Minecraft 1.7.x worl
 - Selection JSON is schema- and type-validated.
 
 Always close Minecraft or stop the dedicated server before writing. The held session lock is an additional coordination barrier, not permission to edit an active world. Do not use `--no-backup` for valuable worlds.
+
+The root `session.lock` file is intentionally excluded from ZIP backups: it is transient OS lock state rather than world content, and Minecraft recreates it when the world is opened.
 
 ## Features
 
