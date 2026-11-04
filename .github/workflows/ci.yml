@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   test:
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -25,6 +26,13 @@ jobs:
           cache: pip
       - run: python -m pip install -r requirements-runtime.txt
       - run: python -m py_compile main_voider.py chunkmap_ui.py
-      - run: python -m unittest discover -s tests -v
+      - name: Run Windows tests with per-test diagnostics
+        if: runner.os == 'Windows'
+        run: python -u scripts/ci_test_runner.py --timeout 90
+        env:
+          PYTHONPATH: .
+      - name: Run unit tests
+        if: runner.os != 'Windows'
+        run: python -m unittest discover -s tests -v
         env:
           PYTHONPATH: .
