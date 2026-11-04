@@ -405,6 +405,7 @@ class HardeningRegressionTests(unittest.TestCase):
             env = os.environ.copy()
             env["PYTHONPATH"] = str(Path(mv.__file__).resolve().parent)
             with mv._world_write_guard(world):
+                self.assertEqual(mv._world_lock_status(world)[0], "active")
                 proc = subprocess.run(
                     [sys.executable, "-c", snippet, str(world)],
                     env=env, text=True, capture_output=True, check=False,
