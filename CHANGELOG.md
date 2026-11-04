@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased — world-safety hardening
+
+### Safety and transaction handling
+- Hold an in-process per-world mutex and the operating-system session lock across each write transaction; fail closed when the lock mechanism is unavailable.
+- Verify full-world backups with an inventory, CRC checks, per-file SHA-256 manifest, and source-stability checks.
+- Stage biome reset across all selected region files, verify the result, and roll back committed region files if verification fails.
+- Treat malformed NBT, chunk-coordinate mismatches, region-worker exceptions, and cancellation as failed/incomplete runs rather than successful skips.
+- Prevent orphan TileEntities by skipping TileEntity-bearing chunks when preservation is requested instead of copying their block entities into empty terrain.
+- Preserve unknown root and Level metadata tags, including GTNH's POSTEA and V, when rebuilding chunks.
+
+### GTNH / Crucible compatibility
+- Recognize GTNH's 512-byte little-endian Biomes16v2 array and 16-bit biome IDs in rules and the chunk selector.
+- Preserve Biomes16v2 during voiding when present; remove it during provider-safe non-Overworld biome reset.
+- Resolve dedicated-server roots through server.properties / level-name and discover Linux CrucibleServers layouts.
+- Add regressions for extended IDs, metadata preservation, rollback, lock reentrancy, backup manifests, and server-root path traversal.
+
 ## 2.1.0 — 2026-07-21
 
 ### Added

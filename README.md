@@ -5,17 +5,21 @@ A safety-first chunk voiding and biome-maintenance tool for Minecraft 1.7.x worl
 ## Safety model
 
 - **Dry run is the default.** Writing requires `--write` or unchecking **Dry run** in the GUI.
-- **Verified full-world ZIP backup is the default before writes.** Use `--no-backup` only if you deliberately accept the risk.
-- Region edits use copy-on-write and atomic replacement.
-- A region that changes during processing is rejected rather than overwritten.
+- **A complete, verified world ZIP is the default before writes.** The archive includes a per-file SHA-256 manifest, CRC verification, and a stable world-inventory check. Use `--no-backup` only when you deliberately accept the recovery risk.
+- The tool holds a per-world in-process mutex and the operating-system lock on `session.lock` for the entire backup/write transaction. If safe locking cannot be established, writing fails closed.
+- Region edits are made in temporary copies and atomically replaced only after the chunk pass succeeds and the source file's device, inode, size, and modification time still match.
+- Malformed chunk NBT, coordinate mismatches, and region-worker failures abort the run instead of being reported as successful skips. Cancellation prevents a working region copy from being committed; earlier region commits remain recoverable from the verified ZIP.
+- Biome reset uses the same lock and verified backup, stages all selected region files before replacing any original, verifies the result, and restores committed originals if verification fails.
 - Headless mode refuses an implicit whole-world operation: provide a selection or `--all-chunks`.
 - Selection JSON is schema- and type-validated.
 
-Always close Minecraft or stop the dedicated server before writing. The tool now tests the operating-system lock behind `session.lock` and refuses writes when another process holds it. A stale, unlocked file does not block use.
+Always close Minecraft or stop the dedicated server before writing. The held session lock is an additional coordination barrier, not permission to edit an active world. Do not use `--no-backup` for valuable worlds.
 
 ## Features
 
-- Provider-safe biome behavior for Overworld and modded dimensions.
+- Provider-safe biome behavior for Overworld and modded dimensions, including GTNH's 16-bit `Biomes16v2` arrays.
+- Biome rules and the visual selector understand legacy 8-bit biome IDs and GTNH 16-bit IDs (0–65535).
+- Unknown root and `Level`-level mod-owned chunk metadata is retained when a chunk is rewritten; terrain-dependent arrays, tile entities, and scheduled block ticks are rebuilt or safely skipped.
 - Visual include/exclude chunk selector with JourneyMap overlays.
 - Rules by dimension for blocks, entities, and biome IDs.
 - Optional entity/tile-entity preservation or safety skips.
@@ -109,7 +113,7 @@ The default selection path is `<world>/.voider-selection.json` when present.
 
 ## Client and dedicated-server worlds
 
-Both client saves and dedicated-server worlds use the same Minecraft 1.7 Anvil region format and are supported. Select the directory containing `level.dat`—for a typical server this is `server/world`, not necessarily the directory containing the server JAR.
+Both client saves and dedicated-server worlds use the same Minecraft 1.7 Anvil region format and are supported. Select the directory containing `level.dat`—for a typical server this is `server/world`, not necessarily the directory containing the server JAR. You may also select the dedicated-server instance root: the tool reads `server.properties`, resolves `level-name`, and rejects paths that escape the instance directory.
 
 The tool discovers and processes the Overworld `region/` directory and nested dimensions such as `DIM-1/region`, `DIM1/region`, and modded dimension folders. Inspect a world without changing it:
 
@@ -117,7 +121,7 @@ The tool discovers and processes the Overworld `region/` directory and nested di
 gtnh-world-voider '/path/to/server/world' --inspect-world --report inventory.json
 ```
 
-Stop the server cleanly before any write. The operating-system `session.lock` check, verified backup, concurrent-file signature check, atomic region replacement, and post-write verifier all apply to server worlds.
+On Linux, world discovery also scans `~/CrucibleServers` and resolves each Crucible server's `server.properties` / `level-name` layout. The selected working path shown in the tool is the actual world folder, not the server root.
 
 ## Read-only verification
 
@@ -129,11 +133,11 @@ This checks sector ranges and overlap, NBT readability, and stored chunk coordin
 
 ## Named presets and write verification
 
-Use `--preset` to apply a reviewed group of processing options:
+Use `--preset` to apply a reviewed group of processing options. A void operation intentionally removes terrain and block entities; the preset only controls entity records and whether TileEntity-bearing chunks are skipped. Mod-owned root and `Level` tags are preserved when safe, but this is not a general migration tool for arbitrary mod state.
 
 - `safe-void`: skip chunks containing entities or tile entities, and mark rewritten chunks.
 - `full-void`: void eligible chunks even when they contain entities or tile entities.
-- `preserve-data`: preserve entity and tile-entity lists while voiding terrain.
+- `preserve-data`: preserve entity records and leave any chunk containing TileEntities untouched. TileEntities are never copied without their backing blocks.
 - `manual`: use individual flags exactly as supplied (default).
 
 ```bash
@@ -151,7 +155,7 @@ python3 -m venv .venv-test
 PYTHON=.venv-test/bin/python ./test.sh
 ```
 
-The regression suite creates synthetic real-NBT Anvil regions and tests client/server layouts, live server locks, native Linux installation, parsing, platform encoding, rules, atomic replacement, backups, verification, and malformed selections.
+The regression suite creates synthetic real-NBT Anvil regions and tests client/server layouts, cross-process and same-process write locks, transactional biome reset and rollback, SHA-256 backup manifests, mod-tag retention, GTNH `Biomes16v2` handling, native Linux installation, parsing, platform encoding, rules, atomic replacement, verification, and malformed selections. The suite does not replace validation against a freshly generated GTNH server world.
 
 ## Release
 
