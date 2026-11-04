@@ -1214,17 +1214,21 @@ def _reset_biomes_region_inplace(mca: Path, tag: str, rx: int, rz: int) -> int:
                 if current is not None and len(current) == 256:
                     continue
                 level.tags = [item for item in level.tags if getattr(item, "name", "") != "Biomes"]
-                level.tags.append(nbt.TAG_Byte_Array(name="Biomes", value=[PLAINS_ID] * 256))
+                biome_tag = nbt.TAG_Byte_Array(name="Biomes")
+                biome_tag.value = [PLAINS_ID] * 256
+                level.tags.append(biome_tag)
             else:
                 level.tags = [item for item in level.tags if getattr(item, "name", "") != "Biomes"]
 
             reset_names = {"TerrainPopulated", "LightPopulated", "Populated", "HeightMap", "InhabitedTime"}
             level.tags = [item for item in level.tags if getattr(item, "name", "") not in reset_names]
+            heightmap = nbt.TAG_Int_Array(name="HeightMap")
+            heightmap.value = [0] * 256
             level.tags.extend([
                 nbt.TAG_Byte(name="TerrainPopulated", value=0),
                 nbt.TAG_Byte(name="LightPopulated", value=0),
                 nbt.TAG_Byte(name="Populated", value=0),
-                nbt.TAG_Int_Array(name="HeightMap", value=[0] * 256),
+                heightmap,
                 nbt.TAG_Long(name="InhabitedTime", value=0),
             ])
             output = io.BytesIO()
