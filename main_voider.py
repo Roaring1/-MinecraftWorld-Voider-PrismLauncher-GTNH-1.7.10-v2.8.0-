@@ -361,38 +361,56 @@ def _world_kind(world:Path) -> str:
     return "minecraft-world"
 
 def _world_lock_status(world:Path) -> Tuple[str, str]:
-    """Best-effort detection of an OS-held Minecraft session.lock."""
-    lock_path = world/"session.lock"
-    if not lock_path.exists():
-        return "unlocked", "session.lock is absent"
+    """Detect a held world lock without disturbing this process's write guard.
+
+    POSIX record locks are process-scoped: a second lockf() call in the same
+    process can succeed and its unlock can release the writer's lock. Serialize
+    the probe with the same per-world mutex used by writers so it never probes
+    a lock owned by this process and cannot race a new local writer.
+    """
+    world = Path(world).expanduser().resolve()
+    key = os.path.normcase(str(world))
+    with _WORLD_WRITE_LOCKS_GUARD:
+        local_lock = _WORLD_WRITE_LOCKS.setdefault(key, threading.Lock())
+    if not local_lock.acquire(blocking=False):
+        return "active", "session.lock is held by a Voider write in this process"
+
     try:
-        if os.name == "posix":
-            import fcntl
-            with lock_path.open("a+b") as fp:
-                try:
-                    fcntl.lockf(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB, 1)
-                except (BlockingIOError, PermissionError):
-                    return "active", "session.lock is held by another process"
-                finally:
-                    try: fcntl.lockf(fp.fileno(), fcntl.LOCK_UN, 1)
-                    except OSError: pass
-            return "unlocked", "session.lock exists but is not OS-locked"
-        if os.name == "nt":
-            import msvcrt
-            with lock_path.open("a+b") as fp:
-                if fp.tell() == 0: fp.write(b"\0"); fp.flush()
-                fp.seek(0)
-                try:
-                    msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)
-                except OSError:
-                    return "active", "session.lock is held by another process"
-                finally:
-                    try: fp.seek(0); msvcrt.locking(fp.fileno(), msvcrt.LK_UNLCK, 1)
-                    except OSError: pass
-            return "unlocked", "session.lock exists but is not OS-locked"
-    except OSError as exc:
-        return "unknown", f"could not test session.lock: {exc}"
-    return "unknown", "OS lock testing is unavailable on this platform"
+        lock_path = world/"session.lock"
+        if lock_path.is_symlink():
+            return "unknown", "session.lock is a symlink; refusing to follow it"
+        if not lock_path.exists():
+            return "unlocked", "session.lock is absent"
+        try:
+            if os.name == "posix":
+                import fcntl
+                with lock_path.open("a+b") as fp:
+                    try:
+                        fcntl.lockf(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB, 1)
+                    except (BlockingIOError, PermissionError):
+                        return "active", "session.lock is held by another process"
+                    finally:
+                        try: fcntl.lockf(fp.fileno(), fcntl.LOCK_UN, 1)
+                        except OSError: pass
+                return "unlocked", "session.lock exists but is not OS-locked"
+            if os.name == "nt":
+                import msvcrt
+                with lock_path.open("a+b") as fp:
+                    if fp.tell() == 0: fp.write(b"\\0"); fp.flush()
+                    fp.seek(0)
+                    try:
+                        msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)
+                    except OSError:
+                        return "active", "session.lock is held by another process"
+                    finally:
+                        try: fp.seek(0); msvcrt.locking(fp.fileno(), msvcrt.LK_UNLCK, 1)
+                        except OSError: pass
+                return "unlocked", "session.lock exists but is not OS-locked"
+        except OSError as exc:
+            return "unknown", f"could not test session.lock: {exc}"
+        return "unknown", "OS lock testing is unavailable on this platform"
+    finally:
+        local_lock.release()
 
 def inspect_world(world:Path) -> Dict[str, object]:
     """Return a read-only client/server world inventory."""
