@@ -572,5 +572,74 @@ class HardeningRegressionTests(unittest.TestCase):
                 mv._backup_world_zip(world)
             self.assertEqual(list(root.glob(f"{world.name}.void-backup-*.zip")), [])
 
+
+    def test_gtnh_unknown_level_and_root_tags_survive_void_rewrite(self):
+        raw = mv._build_void_chunk(0, 0, bytes([1] * 256), False, None,
+                                   False, False, None, 1)
+        root = mv.nbt.NBTFile(buffer=io.BytesIO(raw))
+        level = root["Level"]
+        level.tags.append(mv.nbt.TAG_Long(name="POSTEA", value=-315704904))
+        level.tags.append(mv.nbt.TAG_Byte(name="V", value=1))
+        biome16 = mv.nbt.TAG_Byte_Array(name="Biomes16v2")
+        biome16.value = [0] * 512
+        biome16.value[0] = 0x34
+        biome16.value[1] = 0x12
+        level.tags.append(biome16)
+        root.tags.append(mv.nbt.TAG_String(name="RootModMetadata", value="preserve-me"))
+        source = io.BytesIO()
+        root.write_file(buffer=source)
+
+        rewritten = mv._build_void_chunk(
+            0, 0, None, True, None, False, False, source.getvalue(), 1,
+        )
+        rewritten_root = mv.nbt.NBTFile(buffer=io.BytesIO(rewritten))
+        rewritten_level = rewritten_root["Level"]
+        self.assertEqual(int(rewritten_level["POSTEA"].value), -315704904)
+        self.assertEqual(int(rewritten_level["V"].value), 1)
+        self.assertEqual(bytes(rewritten_level["Biomes16v2"].value), bytes(biome16.value))
+        self.assertEqual(str(rewritten_root["RootModMetadata"].value), "preserve-me")
+        self.assertNotIn("Biomes", rewritten_level)
+
+    def test_gtnh_biomes16v2_filter_reads_little_endian_u16_ids(self):
+        raw = mv._build_void_chunk(0, 0, None, False, None, False, False, None, 1)
+        root = mv.nbt.NBTFile(buffer=io.BytesIO(raw))
+        tag = mv.nbt.TAG_Byte_Array(name="Biomes16v2")
+        tag.value = [0] * 512
+        tag.value[0] = 0xC8
+        tag.value[1] = 0x01
+        root["Level"].tags.append(tag)
+        stream = io.BytesIO()
+        root.write_file(buffer=stream)
+        self.assertIn(456, mv._get_biome_ids(stream.getvalue()))
+        self.assertTrue(mv._chunk_has_biome_id(stream.getvalue(), {456}))
+        self.assertFalse(mv._chunk_has_biome_id(stream.getvalue(), {200}))
+
+    def test_biome_reset_removes_biomes16v2_from_modded_dimension(self):
+        with tempfile.TemporaryDirectory(prefix="voider-biomes16-reset-") as td:
+            world = self._world(Path(td))
+            raw = mv._build_void_chunk(0, 0, None, False, None, False, False, None, 1)
+            root = mv.nbt.NBTFile(buffer=io.BytesIO(raw))
+            tag = mv.nbt.TAG_Byte_Array(name="Biomes16v2")
+            tag.value = [0] * 512
+            tag.value[0] = 9
+            root["Level"].tags.append(tag)
+            root["Level"].tags.append(mv.nbt.TAG_Long(name="POSTEA", value=42))
+            root["Level"].tags.append(mv.nbt.TAG_Byte(name="V", value=1))
+            source = io.BytesIO()
+            root.write_file(buffer=source)
+            region = make_region(world / "DIM1" / "region", source.getvalue())
+            changed = mv.reset_biomes(world, ["DIM1/region"])
+            self.assertEqual(changed, 1)
+            self.assertTrue(mv.verify_world(world)["ok"])
+            with region.open("rb") as fp:
+                _name, off, count = next(mv._iter_chunk_locations(fp))
+                output = mv._read_chunk_payload(fp, off, count)
+            level = read_level(output)
+            self.assertNotIn("Biomes16v2", level)
+            self.assertNotIn("Biomes", level)
+            self.assertEqual(int(level["POSTEA"].value), 42)
+            self.assertEqual(int(level["V"].value), 1)
+            self.assertEqual(int(level["TerrainPopulated"].value), 0)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

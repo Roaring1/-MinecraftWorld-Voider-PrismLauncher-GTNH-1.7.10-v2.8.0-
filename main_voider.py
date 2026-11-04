@@ -85,7 +85,7 @@ class RuleSet:
     block_blacklist: List[str] = field(default_factory=list)
     entity_whitelist: List[str] = field(default_factory=list) # e.g., 'TwilightForest.minotaur' or 'minecraft:zombie'
     entity_blacklist: List[str] = field(default_factory=list)
-    biome_whitelist: List[int] = field(default_factory=list)  # biome ids 0..255
+    biome_whitelist: List[int] = field(default_factory=list)  # biome ids 0..65535
     biome_blacklist: List[int] = field(default_factory=list)
     enabled: bool = True
 
@@ -1682,7 +1682,7 @@ class HelpDialog:
         "Rules (.voider-rules.json):\n"
         " • Whitelists require a match; blacklists block unless whitelisted.\n"
         " • Blocks — Prefer numeric IDs (1.7.x). Entities — 'minecraft:zombie', 'TwilightForest.minotaur'.\n"
-        " • Biomes — numeric 0..255.\n\n"
+        " • Biomes — numeric 0..65535.\n\n"
         "NEI Dump Import:\n"
         " • Auto-scans your instance for a recent NEI “Dump ID Map” and loads it for the Rules Editor.\n\n"
         "Tips:\n"
@@ -1764,7 +1764,7 @@ class RulesEditorDialog:
 
         blw = mk_editor(2, "Blocks (numeric IDs preferred in 1.7) — one per line")
         bew = mk_editor(3, "Entities (minecraft:zombie, TwilightForest.minotaur) — one per line")
-        bmw = mk_editor(4, "Biome IDs (0..255) — one per line")
+        bmw = mk_editor(4, "Biome IDs (0..65535) — one per line")
 
         def mk_text(lf, title):
             import tkinter as tk
@@ -1794,7 +1794,7 @@ class RulesEditorDialog:
         Tooltip(self.entity_blacklist_txt, "Entities that prevent voiding unless whitelisted.",
                 "If a chunk contains a blacklisted entity and it isn’t whitelisted, the chunk will be skipped.")
         Tooltip(self.biome_whitelist_txt, "Biomes that allow voiding when present.",
-                "Enter numeric biome IDs (0–255).")
+                "Enter numeric biome IDs (0–65535).")
         Tooltip(self.biome_blacklist_txt, "Biomes that prevent voiding.",
                 "If any of these biome IDs are present, the chunk is skipped (unless also whitelisted).")
 
