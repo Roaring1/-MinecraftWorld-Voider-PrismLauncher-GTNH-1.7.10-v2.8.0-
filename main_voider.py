@@ -1353,16 +1353,21 @@ def _reset_biomes_region_inplace(mca: Path, tag: str, rx: int, rz: int) -> int:
             if actual != expected:
                 raise IOError(f"Chunk coordinate mismatch at {mca.name}:{idx}: {actual!r} != {expected!r}")
 
+            legacy = level.get("Biomes")
+            if legacy is not None and (
+                not isinstance(legacy, nbt.TAG_Byte_Array) or len(legacy.value) != 256
+            ):
+                raise IOError(f"Malformed Level.Biomes at {mca.name}:{idx}")
+            extended = level.get("Biomes16v2")
+            if extended is not None and (
+                not isinstance(extended, nbt.TAG_Byte_Array) or len(extended.value) != 512
+            ):
+                raise IOError(f"Malformed Level.Biomes16v2 at {mca.name}:{idx}")
+
             if tag == "region":
-                current = None
-                if "Biomes" in level and isinstance(level["Biomes"], nbt.TAG_Byte_Array):
-                    current = bytes(level["Biomes"].value)
-                extended = level.get("Biomes16v2")
-                has_extended = (
-                    isinstance(extended, nbt.TAG_Byte_Array)
-                    and len(extended.value) == 512
-                )
-                if (current is not None and len(current) == 256) or has_extended:
+                current = bytes(legacy.value) if legacy is not None else None
+                has_extended = extended is not None
+                if current is not None or has_extended:
                     continue
                 level.tags = [
                     item for item in level.tags

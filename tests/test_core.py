@@ -462,6 +462,30 @@ class HardeningRegressionTests(unittest.TestCase):
             self.assertTrue(list(world.parent.glob(f"{world.name}.void-backup-*.zip")))
             self.assertEqual(list(region.parent.glob(".*.tmp")), [])
 
+    def test_biome_reset_rejects_malformed_biome_arrays(self):
+        for tag_name, length in (("Biomes", 255), ("Biomes16v2", 511)):
+            with self.subTest(tag_name=tag_name):
+                with tempfile.TemporaryDirectory(prefix="voider-malformed-biome-") as td:
+                    world = self._world(Path(td))
+                    raw = mv._build_void_chunk(
+                        0, 0, None, False, None, False, False, None, 1
+                    )
+                    root = mv.nbt.NBTFile(buffer=io.BytesIO(raw))
+                    malformed = mv.nbt.TAG_Byte_Array(name=tag_name)
+                    malformed.value = [0] * length
+                    root["Level"].tags.append(malformed)
+                    source = io.BytesIO()
+                    root.write_file(buffer=source)
+                    region = make_region(world / "region", source.getvalue())
+                    original = region.read_bytes()
+
+                    with self.assertRaisesRegex(RuntimeError, "Biome reset failed") as caught:
+                        mv.reset_biomes(world, ["region"])
+
+                    self.assertIn(f"Malformed Level.{tag_name}", str(caught.exception.__cause__))
+                    self.assertEqual(region.read_bytes(), original)
+                    self.assertTrue(list(world.parent.glob(f"{world.name}.void-backup-*.zip")))
+
     def test_voider_worker_failure_is_reported_and_original_is_untouched(self):
         with tempfile.TemporaryDirectory(prefix="voider-worker-failure-") as td:
             world = self._world(Path(td))

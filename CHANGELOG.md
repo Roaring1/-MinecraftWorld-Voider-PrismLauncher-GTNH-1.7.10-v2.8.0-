@@ -8,6 +8,7 @@
 - Verify full-world backups with an inventory, CRC checks, per-file SHA-256 manifest, and source-stability checks.
 - Exclude the transient root `session.lock` from backup contents while recording the omission in the manifest, allowing Windows backups to run while the write guard is held.
 - Stage biome reset across all selected region files, verify the result, and roll back committed region files if verification fails.
+- Reject malformed vanilla `Biomes` and GTNH `Biomes16v2` arrays before biome-reset staging can change a region.
 - Treat malformed NBT, chunk-coordinate mismatches, region-worker exceptions, and cancellation as failed/incomplete runs rather than successful skips.
 - Prevent orphan TileEntities by skipping TileEntity-bearing chunks when preservation is requested instead of copying their block entities into empty terrain.
 - Preserve unknown root and Level metadata tags, including GTNH's POSTEA and V, when rebuilding chunks.
