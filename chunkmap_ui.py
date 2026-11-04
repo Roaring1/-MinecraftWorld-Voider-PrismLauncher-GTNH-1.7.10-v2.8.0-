@@ -611,22 +611,25 @@ class JMTileSource:
 
 # ---------- Biomes rule scan (optional “Select by Biome ID rule…”) ----------
 def _get_chunk_biomes(raw: bytes) -> Optional[Set[int]]:
-    """Read legacy 8-bit IDs and GTNH's 16-bit little-endian Biomes16v2."""
+    """Read GTNH's authoritative Biomes16v2 array, or vanilla Biomes as fallback."""
     try:
         from nbt import nbt
         nb = nbt.NBTFile(buffer=__import__("io").BytesIO(raw))
         lvl = nb["Level"]
-        ids: Set[int] = set()
+        if "Biomes16v2" in lvl:
+            extended = lvl["Biomes16v2"]
+            if not isinstance(extended, nbt.TAG_Byte_Array) or len(extended.value) != 512:
+                return None
+            data = bytes(extended.value)
+            return {
+                data[index] | (data[index + 1] << 8)
+                for index in range(0, len(data), 2)
+            } or None
         if "Biomes" in lvl and isinstance(lvl["Biomes"], nbt.TAG_Byte_Array):
             data = bytes(lvl["Biomes"].value)
             if len(data) == 256:
-                ids.update(data)
-        if "Biomes16v2" in lvl and isinstance(lvl["Biomes16v2"], nbt.TAG_Byte_Array):
-            data = bytes(lvl["Biomes16v2"].value)
-            if len(data) == 512:
-                ids.update(data[index] | (data[index + 1] << 8)
-                           for index in range(0, len(data), 2))
-        return ids or None
+                return set(data) or None
+        return None
     except Exception:
         return None
 
