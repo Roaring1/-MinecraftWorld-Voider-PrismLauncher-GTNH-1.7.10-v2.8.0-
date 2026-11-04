@@ -641,5 +641,33 @@ class HardeningRegressionTests(unittest.TestCase):
             self.assertEqual(int(level["V"].value), 1)
             self.assertEqual(int(level["TerrainPopulated"].value), 0)
 
+
+    def test_biome_reset_restores_region_if_durability_barrier_raises(self):
+        with tempfile.TemporaryDirectory(prefix="voider-biome-fsync-rollback-") as td:
+            world = self._world(Path(td))
+            raw = mv._build_void_chunk(0, 0, None, False, None, False, False, None, 1)
+            region = make_region(world / "DIM1" / "region", raw)
+            original = region.read_bytes()
+            original_fsync = mv._fsync_directory
+            calls = {"count": 0}
+
+            def fail_after_replace_once(path):
+                calls["count"] += 1
+                if calls["count"] == 2:
+                    raise RuntimeError("synthetic directory durability failure")
+                return original_fsync(path)
+
+            with mock.patch.object(mv, "_fsync_directory", side_effect=fail_after_replace_once):
+                with self.assertRaisesRegex(RuntimeError, "rolled back"):
+                    mv.reset_biomes(world, ["DIM1/region"])
+
+            self.assertGreaterEqual(calls["count"], 3)
+            self.assertEqual(region.read_bytes(), original)
+            self.assertEqual(list(region.parent.glob(".*.voider-rollback-*")), [])
+            backups = list(world.parent.glob(f"{world.name}.void-backup-*.zip"))
+            self.assertEqual(len(backups), 1)
+            with zipfile.ZipFile(backups[0]) as archive:
+                self.assertIsNone(archive.testzip())
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

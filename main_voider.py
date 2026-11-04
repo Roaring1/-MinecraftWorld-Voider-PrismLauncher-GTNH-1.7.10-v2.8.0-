@@ -1381,14 +1381,17 @@ def reset_biomes(world: Path, dims: Optional[List[str]] = None, *, progress_cb=N
                 )
                 if rollback.exists():
                     raise RuntimeError(f"Refusing to overwrite an existing rollback file: {rollback}")
-                shutil.copy2(mca, rollback)
                 try:
+                    shutil.copy2(mca, rollback)
                     os.replace(temp, mca)
-                    _fsync_directory(mca.parent)
-                    committed.append((mca, rollback))
                 except BaseException:
                     rollback.unlink(missing_ok=True)
                     raise
+                # Record the replacement before any operation that might fail,
+                # including the durability barrier, so the outer exception path
+                # can always restore the original region.
+                committed.append((mca, rollback))
+                _fsync_directory(mca.parent)
 
             audit = verify_world(world)
             if not audit["ok"]:
@@ -1397,7 +1400,14 @@ def reset_biomes(world: Path, dims: Optional[List[str]] = None, *, progress_cb=N
                     + "; ".join(audit["errors"][:5])
                 )
             for _mca, rollback in committed:
-                rollback.unlink(missing_ok=True)
+                try:
+                    rollback.unlink(missing_ok=True)
+                except OSError as cleanup_exc:
+                    print(
+                        f"[warning] Biome reset succeeded but could not remove rollback file "
+                        f"{rollback}: {cleanup_exc}",
+                        file=sys.stderr,
+                    )
             return changed
         except BaseException as exc:
             for mca, rollback in reversed(committed):
