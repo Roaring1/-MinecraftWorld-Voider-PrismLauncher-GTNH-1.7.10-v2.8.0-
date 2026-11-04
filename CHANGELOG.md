@@ -4,6 +4,7 @@
 
 ### Safety and transaction handling
 - Hold an in-process per-world mutex and the operating-system session lock across each write transaction; fail closed when the lock mechanism is unavailable.
+- Serialize lock-status probes with the per-world mutex so a same-process POSIX `lockf()` probe cannot release an active writer's process-scoped lock.
 - Verify full-world backups with an inventory, CRC checks, per-file SHA-256 manifest, and source-stability checks.
 - Exclude the transient root `session.lock` from backup contents while recording the omission in the manifest, allowing Windows backups to run while the write guard is held.
 - Stage biome reset across all selected region files, verify the result, and roll back committed region files if verification fails.
