@@ -789,30 +789,29 @@ def _build_void_chunk(
     source_raw: Optional[bytes],
     populated_flag: int = 1,
 ) -> bytes:
-    ents = nbt.TAG_List(name="Entities", type=nbt.TAG_Compound)
-    tiles = nbt.TAG_List(name="TileEntities", type=nbt.TAG_Compound)
-    ticks = nbt.TAG_List(name="TileTicks", type=nbt.TAG_Compound)
+    """Build a terrain-free 1.7.10 chunk while retaining non-terrain mod metadata."""
+    entities = nbt.TAG_List(name="Entities", type=nbt.TAG_Compound)
+    tile_entities = nbt.TAG_List(name="TileEntities", type=nbt.TAG_Compound)
+    tile_ticks = nbt.TAG_List(name="TileTicks", type=nbt.TAG_Compound)
     biome16_tag = None
     extra_level_tags = []
     extra_root_tags = []
 
     if source_raw:
         try:
-            src = nbt.NBTFile(buffer=io.BytesIO(source_raw))
-            source_level = src["Level"]
+            source = nbt.NBTFile(buffer=io.BytesIO(source_raw))
+            source_level = source["Level"]
             if keep_entities and "Entities" in source_level:
                 if not isinstance(source_level["Entities"], nbt.TAG_List):
                     raise ValueError("Level.Entities has an unexpected NBT type")
-                ents = copy.deepcopy(source_level["Entities"])
+                entities = copy.deepcopy(source_level["Entities"])
+
             if "Biomes16v2" in source_level:
                 candidate = source_level["Biomes16v2"]
                 if not isinstance(candidate, nbt.TAG_Byte_Array) or len(candidate.value) != 512:
                     raise ValueError("Level.Biomes16v2 must be a 512-byte array")
                 biome16_tag = copy.deepcopy(candidate)
 
-            # GTNH 1.7.10 stores mod-owned chunk metadata such as POSTEA and V
-            # directly under Level. Keep all unknown tags verbatim; replace
-            # only fields whose meaning depends on the terrain being removed.
             rewritten_names = {
                 "xPos", "zPos", "LastUpdate", "InhabitedTime",
                 "TerrainPopulated", "LightPopulated", "Populated",
@@ -822,105 +821,104 @@ def _build_void_chunk(
             for tag in source_level.tags:
                 if getattr(tag, "name", "") not in rewritten_names:
                     extra_level_tags.append(copy.deepcopy(tag))
-            for tag in src.tags:
+            for tag in source.tags:
                 if getattr(tag, "name", "") != "Level":
                     extra_root_tags.append(copy.deepcopy(tag))
         except Exception as exc:
             raise ValueError(f"Cannot safely preserve source chunk metadata: {exc}") from exc
-    # TileEntities and TileTicks refer to blocks that this operation removes.
-    # They are never copied into terrain-free chunks; the caller skips the
-    # entire chunk when the user asks to keep TileEntity-bearing chunks intact.
 
     root = nbt.NBTFile()
-    lvl  = nbt.TAG_Compound(name="Level")
-    root.tags.append(lvl)
+    level = nbt.TAG_Compound(name="Level")
+    root.tags.append(level)
+    root.tags.extend(extra_root_tags)
 
-    lvl.tags.extend([
+    level.tags.extend([
         nbt.TAG_Int(name="xPos", value=cx_abs),
         nbt.TAG_Int(name="zPos", value=cz_abs),
         nbt.TAG_Long(name="LastUpdate", value=0),
         nbt.TAG_Long(name="InhabitedTime", value=0),
         nbt.TAG_Byte(name="TerrainPopulated", value=int(populated_flag)),
-        nbt.TAG_Byte(name="LightPopulated",   value=int(populated_flag)),
+        nbt.TAG_Byte(name="LightPopulated", value=int(populated_flag)),
     ])
 
-    hm = nbt.TAG_Int_Array(name="HeightMap")
-    hm.value = [0] * 256
-    lvl.tags.append(hm)
+    heightmap = nbt.TAG_Int_Array(name="HeightMap")
+    heightmap.value = [0] * 256
+    level.tags.append(heightmap)
 
     if biome_bytes is not None and len(biome_bytes) == 256:
-        bio = nbt.TAG_Byte_Array(name="Biomes")
-        bio.value = list(biome_bytes)
-        lvl.tags.append(bio)
+        biome_tag = nbt.TAG_Byte_Array(name="Biomes")
+        biome_tag.value = list(biome_bytes)
+        level.tags.append(biome_tag)
+    if biome16_tag is not None:
+        level.tags.append(biome16_tag)
 
-    lvl.tags.extend([ents, tiles, ticks])
+    level.tags.extend([entities, tile_entities, tile_ticks])
 
     sections = nbt.TAG_List(name="Sections", type=nbt.TAG_Compound)
-    lvl.tags.append(sections)
+    level.tags.append(sections)
 
-    zeros4096  = [0] * 4096
-    zeros2048  = [0] * 2048
-    skylight_ff= [0xFF] * 2048
-    sec_blocks = []
-    sec_data = []
-    sec_add = []
+    zeros4096 = [0] * 4096
+    zeros2048 = [0] * 2048
+    skylight_full = [0xFF] * 2048
+    section_blocks = []
+    section_data = []
+    section_add = []
 
     for y in range(16):
-        sec = nbt.TAG_Compound()
-        sec.tags.append(nbt.TAG_Byte(name="Y", value=y))
-
-        blk = nbt.TAG_Byte_Array(name="Blocks");     blk.value = zeros4096.copy()
-        dat = nbt.TAG_Byte_Array(name="Data");       dat.value = zeros2048.copy()
-        sky = nbt.TAG_Byte_Array(name="SkyLight");   sky.value = skylight_ff.copy()
-        bl  = nbt.TAG_Byte_Array(name="BlockLight"); bl.value = zeros2048.copy()
-
-        sec.tags.extend([blk, dat, sky, bl])
-        sections.tags.append(sec)
-        sec_blocks.append(blk)
-        sec_data.append(dat)
-        sec_add.append(None)
+        section = nbt.TAG_Compound()
+        section.tags.append(nbt.TAG_Byte(name="Y", value=y))
+        blocks = nbt.TAG_Byte_Array(name="Blocks")
+        blocks.value = zeros4096.copy()
+        data = nbt.TAG_Byte_Array(name="Data")
+        data.value = zeros2048.copy()
+        sky_light = nbt.TAG_Byte_Array(name="SkyLight")
+        sky_light.value = skylight_full.copy()
+        block_light = nbt.TAG_Byte_Array(name="BlockLight")
+        block_light.value = zeros2048.copy()
+        section.tags.extend([blocks, data, sky_light, block_light])
+        sections.tags.append(section)
+        section_blocks.append(blocks)
+        section_data.append(data)
+        section_add.append(None)
 
     if mark_void:
-        lvl.tags.append(nbt.TAG_Byte(name="Voider", value=1))
+        level.tags.append(nbt.TAG_Byte(name="Voider", value=1))
+
+    # Preserve mod-specific Level tags (e.g. GTNH POSTEA and V) that do not
+    # encode the removed block/biome/entity data.
+    level.tags.extend(extra_level_tags)
 
     if platform is not None:
-        px, pz, py, size, bid, meta = platform
+        px, pz, py, size, block_id, meta = platform
         center_cx = px // 16
         center_cz = pz // 16
         if center_cx == cx_abs and center_cz == cz_abs and 0 <= py <= 255:
             half = size // 2
             x0, z0 = px - half, pz - half
-            secY   = py // 16
-            y_in   = py % 16
+            section_y = py // 16
+            y_in_section = py % 16
             for dx in range(size):
                 for dz in range(size):
-                    wx = x0 + dx
-                    wz = z0 + dz
-                    if (wx // 16) == cx_abs and (wz // 16) == cz_abs:
-                        xl  = wx & 15
-                        zl  = wz & 15
-                        # Legacy Anvil section arrays are indexed Y-Z-X:
-                        # index = y*256 + z*16 + x.
-                        idx = (y_in * 256) + (zl * 16) + xl
-                        sec_blocks[secY].value[idx] = bid & 0xFF
-                        _nibble_set(sec_data[secY].value, idx, meta & 0x0F)
-                        high = (bid >> 8) & 0x0F
+                    world_x = x0 + dx
+                    world_z = z0 + dz
+                    if (world_x // 16) == cx_abs and (world_z // 16) == cz_abs:
+                        local_x = world_x & 15
+                        local_z = world_z & 15
+                        index = (y_in_section * 256) + (local_z * 16) + local_x
+                        section_blocks[section_y].value[index] = block_id & 0xFF
+                        _nibble_set(section_data[section_y].value, index, meta & 0x0F)
+                        high = (block_id >> 8) & 0x0F
                         if high:
-                            if sec_add[secY] is None:
+                            if section_add[section_y] is None:
                                 add_tag = nbt.TAG_Byte_Array(name="Add")
                                 add_tag.value = [0] * 2048
-                                sections[secY].tags.append(add_tag)
-                                sec_add[secY] = add_tag
-                            _nibble_set(sec_add[secY].value, idx, high)
+                                sections[section_y].tags.append(add_tag)
+                                section_add[section_y] = add_tag
+                            _nibble_set(section_add[section_y].value, index, high)
 
-    outb = io.BytesIO()
-    root.write_file(buffer=outb)
-    return outb.getvalue()
-                 _nibble_set(sec_add[secY].value, idx, high)
-
-    outb = io.BytesIO()
-    root.write_file(buffer=outb)
-    return outb.getvalue()
+    output = io.BytesIO()
+    root.write_file(buffer=output)
+    return output.getvalue()
 
 # ---------------- Backup-biomes helpers ----------------
 def _read_biomes_from_region(region_path: Path, idx: int) -> Optional[bytes]:
