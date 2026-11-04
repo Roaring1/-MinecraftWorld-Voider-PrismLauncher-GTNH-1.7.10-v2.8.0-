@@ -737,5 +737,91 @@ class HardeningRegressionTests(unittest.TestCase):
             self.assertNotIn("Biomes", level)
             self.assertEqual(bytes(level["Biomes16v2"].value), expected)
 
+
+    def test_headless_selection_scopes_only_named_dimensions(self):
+        with tempfile.TemporaryDirectory(prefix="voider-selection-scope-") as td:
+            root = Path(td)
+            world = self._world(root)
+            raw = mv._build_void_chunk(0, 0, bytes([1] * 256), True, None,
+                                       False, False, None, 1)
+            make_region(world / "region", raw)
+            make_region(world / "DIM-1" / "region", raw)
+            selection = root / "overworld-only.json"
+            selection.write_text(json.dumps({
+                "region": {"include": [[0, 0]], "exclude": []}
+            }), encoding="utf-8")
+            report_path = root / "scope-report.json"
+            proc = subprocess.run(
+                [
+                    sys.executable, str(Path(mv.__file__)), str(world),
+                    "--headless", "--selection", str(selection), "--dry-run",
+                    "--include-void", "--report", str(report_path),
+                ],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("Would void 1 chunk(s) out of 1 scanned.", proc.stdout)
+            self.assertNotIn("DIM-1/region", proc.stdout)
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["scanned_chunks"], 1)
+            self.assertEqual(report["changed_chunks"], 1)
+            self.assertEqual(report["selection_scope"], ["region"])
+
+    def test_headless_all_chunks_explicitly_overrides_saved_selection(self):
+        with tempfile.TemporaryDirectory(prefix="voider-all-chunks-scope-") as td:
+            root = Path(td)
+            world = self._world(root)
+            raw = mv._build_void_chunk(0, 0, bytes([1] * 256), True, None,
+                                       False, False, None, 1)
+            make_region(world / "region", raw)
+            make_region(world / "DIM-1" / "region", raw)
+            (world / ".voider-selection.json").write_text(json.dumps({
+                "region": {"include": [[0, 0]], "exclude": []}
+            }), encoding="utf-8")
+            report_path = root / "all-scope-report.json"
+            proc = subprocess.run(
+                [
+                    sys.executable, str(Path(mv.__file__)), str(world),
+                    "--headless", "--all-chunks", "--dry-run",
+                    "--include-void", "--report", str(report_path),
+                ],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("--all-chunks explicitly authorizes every discovered dimension", proc.stdout)
+            self.assertIn("Would void 2 chunk(s) out of 2 scanned.", proc.stdout)
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["scanned_chunks"], 2)
+            self.assertEqual(report["selection_scope"], ["DIM-1/region", "region"])
+            self.assertTrue(report["all_chunks"])
+
+    def test_headless_empty_selection_fails_closed(self):
+        with tempfile.TemporaryDirectory(prefix="voider-empty-selection-") as td:
+            root = Path(td)
+            world = self._world(root)
+            make_region(
+                world / "region",
+                mv._build_void_chunk(0, 0, bytes([1] * 256), True, None,
+                                     False, False, None, 1),
+            )
+            selection = root / "empty-selection.json"
+            selection.write_text("{}", encoding="utf-8")
+            proc = subprocess.run(
+                [
+                    sys.executable, str(Path(mv.__file__)), str(world),
+                    "--headless", "--selection", str(selection), "--dry-run",
+                ],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("contains no dimension scopes", proc.stderr)
+
+    def test_run_voider_rejects_stale_dimension_scope(self):
+        with tempfile.TemporaryDirectory(prefix="voider-stale-scope-") as td:
+            world = self._world(Path(td))
+            args = self._write_args(dry_run=True, selection_scope={"DIM-999/region"})
+            with self.assertRaisesRegex(ValueError, "missing dimension"):
+                mv.run_voider(world, {}, {}, args)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

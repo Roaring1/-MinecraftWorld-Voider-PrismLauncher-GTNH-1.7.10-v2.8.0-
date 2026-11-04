@@ -10,7 +10,10 @@ A safety-first chunk voiding and biome-maintenance tool for Minecraft 1.7.x worl
 - Region edits are made in temporary copies and atomically replaced only after the chunk pass succeeds and the source file's device, inode, size, and modification time still match.
 - Malformed chunk NBT, coordinate mismatches, and region-worker failures abort the run instead of being reported as successful skips. Cancellation prevents a working region copy from being committed; earlier region commits remain recoverable from the verified ZIP.
 - Biome reset uses the same lock and verified backup, stages all selected region files before replacing any original, verifies the result, and restores committed originals if verification fails.
-- Headless mode refuses an implicit whole-world operation: provide a selection or `--all-chunks`.
+- Headless mode refuses an implicit whole-world operation: provide a non-empty selection or explicitly pass `--all-chunks`.
+- A selection authorizes only the dimension tags it names. Dimensions omitted from the selection are not scanned. An empty or invalid selection fails closed.
+- `--all-chunks` explicitly overrides a saved selection and authorizes every discovered dimension (still subject to `--only`, `--exclude`, bounds, and rules).
+- The GUI also requires a valid saved chunk selection before starting; it will not silently interpret a missing or malformed file as “all chunks.”
 - Selection JSON is schema- and type-validated.
 
 Always close Minecraft or stop the dedicated server before writing. The held session lock is an additional coordination barrier, not permission to edit an active world. Do not use `--no-backup` for valuable worlds.
@@ -109,7 +112,7 @@ Explicitly authorize all chunks after filters:
 python3 main_voider.py '/path/to/world' --headless --all-chunks --only DIM-1/region --dry-run
 ```
 
-The default selection path is `<world>/.voider-selection.json` when present.
+A selection file scopes work to the dimension keys it contains. For example, a file containing only `region` will never process `DIM-1/region` or modded dimensions. An empty selection is rejected. To deliberately include every discovered dimension, use `--all-chunks`; that flag overrides any saved selection file.
 
 ## Client and dedicated-server worlds
 

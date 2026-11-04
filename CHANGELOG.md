@@ -15,6 +15,7 @@
 - Preserve Biomes16v2 during voiding when present; remove it during provider-safe non-Overworld biome reset.
 - Resolve dedicated-server roots through server.properties / level-name and discover Linux CrucibleServers layouts.
 - Add regressions for extended IDs, metadata preservation, rollback, lock reentrancy, backup manifests, and server-root path traversal.
+- Fail closed on selection files with no dimension scopes; selection runs are limited to named dimensions, and explicit `--all-chunks` overrides saved selections.
 
 ## 2.1.0 — 2026-07-21
 

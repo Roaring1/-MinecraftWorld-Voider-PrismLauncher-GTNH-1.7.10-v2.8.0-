@@ -2289,14 +2289,25 @@ class VoiderStatusUI:
                 rules_local = _load_rules(world)
 
                 sel_path = world/".voider-selection.json"
-                sel_include: Dict[str, Set[Tuple[int,int]]] = {}
-                sel_exclude: Dict[str, Set[Tuple[int,int]]] = {}
-                if sel_path.exists():
-                    try:
-                        sel_include, sel_exclude = _load_selection(sel_path)
-                        print(f"Loaded selection from {sel_path.name}")
-                    except Exception as e:
-                        print(f"[warn] Failed to read selection JSON: {e!r}")
+                if not sel_path.is_file():
+                    raise RuntimeError(
+                        "No saved chunk selection exists. Open Chunk Selector and save a selection; "
+                        "whole-world processing is available only through the explicit CLI --all-chunks option."
+                    )
+                try:
+                    sel_include, sel_exclude = _load_selection(sel_path)
+                except Exception as exc:
+                    raise RuntimeError(f"Refusing to run with an invalid selection file: {exc}") from exc
+                self.args.selection_scope = set(sel_include) | set(sel_exclude)
+                if not self.args.selection_scope:
+                    raise RuntimeError(
+                        "The saved selection contains no dimension scopes. Save a selection or explicitly "
+                        "authorize all chunks through the headless CLI."
+                    )
+                print(
+                    f"Loaded selection from {sel_path.name}; authorized dimensions: "
+                    + ", ".join(sorted(self.args.selection_scope))
+                )
 
                 prog_lock=threading.Lock()
                 def prog_cb(done, total, line):
@@ -2490,9 +2501,28 @@ def _run_voider_unlocked(world:Path,
     only=[s.strip() for s in args.only.split(",")] if args.only else None
     exclude=[s.strip() for s in args.exclude.split(",")] if args.exclude else None
 
-    region_dirs=_find_region_dirs(world)
-    if only:   region_dirs=[d for d in region_dirs if _dim_tag(world,d) in only]
-    if exclude:region_dirs=[d for d in region_dirs if _dim_tag(world,d) not in exclude]
+    region_dirs = _find_region_dirs(world)
+    selection_scope = getattr(args, "selection_scope", None)
+    if selection_scope is not None:
+        selection_scope = set(selection_scope)
+        available_tags = {_dim_tag(world, directory) for directory in region_dirs}
+        unknown_tags = selection_scope - available_tags
+        if unknown_tags:
+            raise ValueError(
+                "Selection refers to missing dimension(s): " + ", ".join(sorted(unknown_tags))
+            )
+        if not selection_scope:
+            raise ValueError(
+                "Selection authorizes no dimensions. Use an explicit selection or --all-chunks."
+            )
+        region_dirs = [
+            directory for directory in region_dirs
+            if _dim_tag(world, directory) in selection_scope
+        ]
+    if only:
+        region_dirs = [d for d in region_dirs if _dim_tag(world, d) in only]
+    if exclude:
+        region_dirs = [d for d in region_dirs if _dim_tag(world, d) not in exclude]
 
     bbox=None
     if args.bbox:
@@ -2732,17 +2762,37 @@ def main()->bool:
         if not (world/"level.dat").is_file():
             ap.error(f"level.dat not found under {world}")
         selection_path = Path(args.selection).expanduser().resolve() if args.selection else world/".voider-selection.json"
-        if selection_path.exists():
+        if args.all_chunks:
+            # Explicit --all-chunks always overrides a persisted selection file.
+            # This makes the operator's all-world authorization unambiguous.
+            sel_include, sel_exclude = {}, {}
+            args.selection_scope = {
+                _dim_tag(world, directory) for directory in _find_region_dirs(world)
+            }
+            print(
+                "--all-chunks explicitly authorizes every discovered dimension "
+                "after --only/--exclude and coordinate filters."
+            )
+        elif selection_path.is_file():
             try:
                 sel_include, sel_exclude = _load_selection(selection_path)
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 ap.error(f"invalid selection file {selection_path}: {exc}")
-            print(f"Loaded validated selection: {selection_path}")
-        elif args.all_chunks:
-            sel_include, sel_exclude = {}, {}
-            print("No selection file; --all-chunks explicitly authorizes the filtered world scope.")
+            args.selection_scope = set(sel_include) | set(sel_exclude)
+            if not args.selection_scope:
+                ap.error(
+                    f"selection file {selection_path} contains no dimension scopes; "
+                    "use --all-chunks to explicitly authorize the entire world"
+                )
+            print(
+                f"Loaded validated selection: {selection_path} "
+                f"(dimensions: {', '.join(sorted(args.selection_scope))})"
+            )
         else:
-            ap.error("headless mode requires --selection, an existing .voider-selection.json, or --all-chunks")
+            ap.error(
+                "headless mode requires a non-empty --selection, an existing non-empty "
+                ".voider-selection.json, or explicit --all-chunks"
+            )
         rules=_load_rules(world)
         scanned, changed=run_voider(world, sel_include, sel_exclude, args, rules=rules)
         verb="Would void" if args.dry_run else "Voided"
@@ -2756,7 +2806,9 @@ def main()->bool:
             result={"world": str(world), "mode": "dry-run" if args.dry_run else "write",
                     "scanned_chunks": scanned, "changed_chunks": changed,
                     "selection": str(selection_path) if selection_path.exists() else None,
-                    "all_chunks": bool(args.all_chunks), "backup_enabled": bool(args.backup),
+                    "all_chunks": bool(args.all_chunks),
+                    "selection_scope": sorted(getattr(args, "selection_scope", [])),
+                    "backup_enabled": bool(args.backup),
                     "preset": args.preset, "post_write_verification": audit}
             Path(args.report).expanduser().write_text(json.dumps(result, indent=2)+"\n", encoding="utf-8")
         return audit is None or bool(audit["ok"])
@@ -2825,6 +2877,10 @@ def main()->bool:
         for dimtag,d in sel.items():
             sel_include[dimtag]=set(tuple(x) for x in d.get("include",[]))
             sel_exclude[dimtag]=set(tuple(x) for x in d.get("exclude",[]))
+        args.selection_scope = set(sel_include) | set(sel_exclude)
+        if not args.selection_scope:
+            print("ERROR: Chunk Selector returned no authorized dimensions; refusing to process the world.", file=sys.stderr)
+            return False
 
         rules=_load_rules(world)
 
