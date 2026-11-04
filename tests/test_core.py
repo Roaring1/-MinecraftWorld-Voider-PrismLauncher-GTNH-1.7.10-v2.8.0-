@@ -633,6 +633,23 @@ class HardeningRegressionTests(unittest.TestCase):
         self.assertTrue(mv._chunk_has_biome_id(stream.getvalue(), {456}))
         self.assertFalse(mv._chunk_has_biome_id(stream.getvalue(), {200}))
 
+    def test_gtnh_biomes16v2_is_authoritative_over_legacy_biomes(self):
+        raw = mv._build_void_chunk(0, 0, None, False, None, False, False, None, 1)
+        root = mv.nbt.NBTFile(buffer=io.BytesIO(raw))
+        legacy = mv.nbt.TAG_Byte_Array(name="Biomes")
+        legacy.value = [1] * 256
+        extended = mv.nbt.TAG_Byte_Array(name="Biomes16v2")
+        extended.value = [0] * 512
+        extended.value[0] = 0xC8
+        extended.value[1] = 0x01
+        root["Level"].tags.extend([legacy, extended])
+        stream = io.BytesIO()
+        root.write_file(buffer=stream)
+        biome_ids = mv._get_biome_ids(stream.getvalue())
+        self.assertEqual(biome_ids, {456})
+        self.assertTrue(mv._chunk_has_biome_id(stream.getvalue(), {456}))
+        self.assertFalse(mv._chunk_has_biome_id(stream.getvalue(), {1}))
+
     def test_biome_reset_removes_biomes16v2_from_modded_dimension(self):
         with tempfile.TemporaryDirectory(prefix="voider-biomes16-reset-") as td:
             world = self._world(Path(td))
