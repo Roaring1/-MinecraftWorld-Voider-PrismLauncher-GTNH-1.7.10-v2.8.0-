@@ -14,6 +14,7 @@
 
 ### GTNH / Crucible compatibility
 - Recognize GTNH's 512-byte little-endian Biomes16v2 array and 16-bit biome IDs in rules and the chunk selector.
+- Treat a valid Biomes16v2 array as authoritative when present; use legacy Biomes only when the GTNH array is absent.
 - Preserve Biomes16v2 during voiding when present; remove it during provider-safe non-Overworld biome reset.
 - Resolve dedicated-server roots through server.properties / level-name and discover Linux CrucibleServers layouts.
 - Add regressions for extended IDs, metadata preservation, rollback, lock reentrancy, backup manifests, and server-root path traversal.
