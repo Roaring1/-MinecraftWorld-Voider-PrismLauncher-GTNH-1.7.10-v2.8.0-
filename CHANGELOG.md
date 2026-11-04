@@ -16,6 +16,7 @@
 - Resolve dedicated-server roots through server.properties / level-name and discover Linux CrucibleServers layouts.
 - Add regressions for extended IDs, metadata preservation, rollback, lock reentrancy, backup manifests, and server-root path traversal.
 - Fail closed on selection files with no dimension scopes; selection runs are limited to named dimensions, and explicit `--all-chunks` overrides saved selections.
+- Keep headless CLI failures non-interactive so a Tk modal cannot stall a command-line run or CI; use a writable file handle for the Windows durability flush.
 
 ## 2.1.0 — 2026-07-21
 

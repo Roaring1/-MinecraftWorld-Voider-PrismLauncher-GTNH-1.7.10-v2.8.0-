@@ -823,5 +823,27 @@ class HardeningRegressionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing dimension"):
                 mv.run_voider(world, {}, {}, args)
 
+
+    def test_headless_failure_returns_without_opening_gui_dialog(self):
+        with tempfile.TemporaryDirectory(prefix="voider-headless-error-") as td:
+            root = Path(td)
+            world = self._world(root)
+            make_region(world / "region", b"malformed chunk NBT")
+            selection = root / "selection.json"
+            selection.write_text(json.dumps({
+                "region": {"include": [[0, 0]], "exclude": []}
+            }), encoding="utf-8")
+            proc = subprocess.run(
+                [
+                    sys.executable, str(Path(mv.__file__)), str(world),
+                    "--headless", "--selection", str(selection),
+                    "--include-void", "--preset", "full-void", "--write",
+                ],
+                text=True, capture_output=True, check=False, timeout=20,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("Voider did not complete", proc.stderr)
+            self.assertNotIn("Traceback", proc.stdout)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

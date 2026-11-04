@@ -1597,7 +1597,8 @@ def _backup_world_zip(world:Path):
 
         if inventory() != before:
             raise RuntimeError("World inventory changed after backup verification")
-        with temporary.open("rb") as fp:
+        # Open read/write so Windows' _commit() path has a writable handle.
+        with temporary.open("r+b") as fp:
             os.fsync(fp.fileno())
         os.replace(temporary, destination)
         _fsync_directory(destination.parent)
@@ -2896,11 +2897,14 @@ if __name__ == "__main__":
     except Exception:
         import traceback
         tb=traceback.format_exc()
-        try:
-            import tkinter as tk
-            from tkinter import messagebox
-            tk.Tk().withdraw(); messagebox.showerror("Voider crashed", tb)
-        except Exception:
-            pass
+        # Headless/CLI failures must remain non-interactive. A modal Tk
+        # message box can block subprocesses and CI runners indefinitely.
+        if "--headless" not in sys.argv:
+            try:
+                import tkinter as tk
+                from tkinter import messagebox
+                tk.Tk().withdraw(); messagebox.showerror("Voider crashed", tb)
+            except Exception:
+                pass
         print(tb, file=sys.stderr)
         sys.exit(1)
