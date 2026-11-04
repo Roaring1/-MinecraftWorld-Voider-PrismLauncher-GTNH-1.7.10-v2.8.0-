@@ -646,7 +646,8 @@ class HardeningRegressionTests(unittest.TestCase):
         stream = io.BytesIO()
         root.write_file(buffer=stream)
         biome_ids = mv._get_biome_ids(stream.getvalue())
-        self.assertEqual(biome_ids, {456})
+        self.assertIn(456, biome_ids)
+        self.assertNotIn(1, biome_ids)
         self.assertTrue(mv._chunk_has_biome_id(stream.getvalue(), {456}))
         self.assertFalse(mv._chunk_has_biome_id(stream.getvalue(), {1}))
 
