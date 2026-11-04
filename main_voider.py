@@ -20,6 +20,9 @@ import queue
 import hashlib
 import shutil
 import copy
+import stat as statmod
+import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from zipfile import ZipFile, ZIP_DEFLATED
@@ -82,7 +85,7 @@ class RuleSet:
     block_blacklist: List[str] = field(default_factory=list)
     entity_whitelist: List[str] = field(default_factory=list) # e.g., 'TwilightForest.minotaur' or 'minecraft:zombie'
     entity_blacklist: List[str] = field(default_factory=list)
-    biome_whitelist: List[int] = field(default_factory=list)  # biome ids 0..255
+    biome_whitelist: List[int] = field(default_factory=list)  # biome ids 0..65535
     biome_blacklist: List[int] = field(default_factory=list)
     enabled: bool = True
 
@@ -103,8 +106,8 @@ PRESETS = {
         "keep_entities": False, "keep_tileentities": False, "mark_void": True,
     },
     "preserve-data": {
-        "skip_if_entities": False, "skip_if_tileentities": False,
-        "keep_entities": True, "keep_tileentities": True, "mark_void": True,
+        "skip_if_entities": False, "skip_if_tileentities": True,
+        "keep_entities": True, "keep_tileentities": False, "mark_void": True,
     },
 }
 
@@ -281,6 +284,8 @@ def _write_chunk_payload(fp, sector_off:int, sector_cnt:int, raw_nbt:bytes):
         if pad:
             fp.write(b"\x00"*pad)
         new_off = fp.tell() // SECTOR_BYTES
+        if new_off > 0xFFFFFF:
+            raise ValueError(f"Region file exceeds the 24-bit sector offset limit: {new_off}")
         fp.write(payload)
         pad2 = (-len(payload)) % SECTOR_BYTES
         if pad2:
@@ -319,6 +324,33 @@ def _find_region_dirs(world:Path) -> List[Path]:
 def _dim_tag(world:Path, region_dir:Path) -> str:
     return str(region_dir.relative_to(world)).replace("\\","/")
 
+def _resolve_world_path(path: Path) -> Path:
+    """Resolve either a world folder or a dedicated-server instance folder."""
+    selected = Path(path).expanduser().resolve()
+    if (selected / "level.dat").is_file():
+        return selected
+    properties = selected / "server.properties"
+    if not properties.is_file():
+        return selected
+    level_name = "world"
+    try:
+        for line in properties.read_text(encoding="utf-8", errors="replace").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            if key.strip() == "level-name":
+                level_name = value.strip()
+                break
+    except OSError as exc:
+        raise RuntimeError(f"Could not read {properties}: {exc}") from exc
+    if not level_name or Path(level_name).is_absolute():
+        raise ValueError(f"Unsafe server.properties level-name: {level_name!r}")
+    candidate = (selected / level_name).resolve()
+    if candidate != selected and selected not in candidate.parents:
+        raise ValueError(f"server.properties level-name escapes the server directory: {level_name!r}")
+    return candidate
+
 def _world_kind(world:Path) -> str:
     """Classify a selected save without changing how its Anvil data is read."""
     if (world/"server.properties").is_file() or (world.parent/"server.properties").is_file():
@@ -329,38 +361,56 @@ def _world_kind(world:Path) -> str:
     return "minecraft-world"
 
 def _world_lock_status(world:Path) -> Tuple[str, str]:
-    """Best-effort detection of an OS-held Minecraft session.lock."""
-    lock_path = world/"session.lock"
-    if not lock_path.exists():
-        return "unlocked", "session.lock is absent"
+    """Detect a held world lock without disturbing this process's write guard.
+
+    POSIX record locks are process-scoped: a second lockf() call in the same
+    process can succeed and its unlock can release the writer's lock. Serialize
+    the probe with the same per-world mutex used by writers so it never probes
+    a lock owned by this process and cannot race a new local writer.
+    """
+    world = Path(world).expanduser().resolve()
+    key = os.path.normcase(str(world))
+    with _WORLD_WRITE_LOCKS_GUARD:
+        local_lock = _WORLD_WRITE_LOCKS.setdefault(key, threading.Lock())
+    if not local_lock.acquire(blocking=False):
+        return "active", "session.lock is held by a Voider write in this process"
+
     try:
-        if os.name == "posix":
-            import fcntl
-            with lock_path.open("a+b") as fp:
-                try:
-                    fcntl.lockf(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB, 1)
-                except (BlockingIOError, PermissionError):
-                    return "active", "session.lock is held by another process"
-                finally:
-                    try: fcntl.lockf(fp.fileno(), fcntl.LOCK_UN, 1)
-                    except OSError: pass
-            return "unlocked", "session.lock exists but is not OS-locked"
-        if os.name == "nt":
-            import msvcrt
-            with lock_path.open("a+b") as fp:
-                if fp.tell() == 0: fp.write(b"\0"); fp.flush()
-                fp.seek(0)
-                try:
-                    msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)
-                except OSError:
-                    return "active", "session.lock is held by another process"
-                finally:
-                    try: fp.seek(0); msvcrt.locking(fp.fileno(), msvcrt.LK_UNLCK, 1)
-                    except OSError: pass
-            return "unlocked", "session.lock exists but is not OS-locked"
-    except OSError as exc:
-        return "unknown", f"could not test session.lock: {exc}"
-    return "unknown", "OS lock testing is unavailable on this platform"
+        lock_path = world/"session.lock"
+        if lock_path.is_symlink():
+            return "unknown", "session.lock is a symlink; refusing to follow it"
+        if not lock_path.exists():
+            return "unlocked", "session.lock is absent"
+        try:
+            if os.name == "posix":
+                import fcntl
+                with lock_path.open("a+b") as fp:
+                    try:
+                        fcntl.lockf(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB, 1)
+                    except (BlockingIOError, PermissionError):
+                        return "active", "session.lock is held by another process"
+                    finally:
+                        try: fcntl.lockf(fp.fileno(), fcntl.LOCK_UN, 1)
+                        except OSError: pass
+                return "unlocked", "session.lock exists but is not OS-locked"
+            if os.name == "nt":
+                import msvcrt
+                with lock_path.open("a+b") as fp:
+                    if fp.tell() == 0: fp.write(b"\\0"); fp.flush()
+                    fp.seek(0)
+                    try:
+                        msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)
+                    except OSError:
+                        return "active", "session.lock is held by another process"
+                    finally:
+                        try: fp.seek(0); msvcrt.locking(fp.fileno(), msvcrt.LK_UNLCK, 1)
+                        except OSError: pass
+                return "unlocked", "session.lock exists but is not OS-locked"
+        except OSError as exc:
+            return "unknown", f"could not test session.lock: {exc}"
+        return "unknown", "OS lock testing is unavailable on this platform"
+    finally:
+        local_lock.release()
 
 def inspect_world(world:Path) -> Dict[str, object]:
     """Return a read-only client/server world inventory."""
@@ -385,9 +435,80 @@ def _assert_world_not_active(world:Path) -> None:
             "Stop it cleanly before writing."
         )
     if status == "unknown":
-        print(f"[warning] World activity could not be confirmed: {detail}", file=sys.stderr)
-    else:
-        print(f"World lock check: {detail}")
+        raise RuntimeError(f"Cannot safely establish that the world is offline: {detail}")
+
+_WORLD_WRITE_LOCKS_GUARD = threading.Lock()
+_WORLD_WRITE_LOCKS: Dict[str, threading.Lock] = {}
+
+
+@contextmanager
+def _world_write_guard(world: Path):
+    """Serialize in-process writers and hold Minecraft's OS session lock.
+
+    POSIX record locks are process-scoped, so they do not serialize two
+    threads in the same Python process. The per-world mutex closes that gap;
+    the OS lock coordinates with Minecraft and other applications.
+    """
+    world = Path(world).expanduser().resolve()
+    if not world.is_dir() or not (world / "level.dat").is_file():
+        raise ValueError(f"Not a Minecraft world folder: {world}")
+    key = os.path.normcase(str(world))
+    with _WORLD_WRITE_LOCKS_GUARD:
+        local_lock = _WORLD_WRITE_LOCKS.setdefault(key, threading.Lock())
+    if not local_lock.acquire(blocking=False):
+        raise RuntimeError(f"Another Voider write or biome reset is already running for {world}")
+
+    fp = None
+    locked = False
+    lock_module = None
+    try:
+        lock_path = world / "session.lock"
+        if lock_path.is_symlink():
+            raise RuntimeError(f"Refusing symlinked session.lock: {lock_path}")
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(str(lock_path), flags, 0o600)
+        fp = os.fdopen(fd, "r+b")
+        if os.name == "posix":
+            import fcntl as lock_module
+            try:
+                lock_module.lockf(fp.fileno(), lock_module.LOCK_EX | lock_module.LOCK_NB, 1, 0, os.SEEK_SET)
+            except (BlockingIOError, PermissionError) as exc:
+                raise RuntimeError(
+                    f"World appears to be open by Minecraft or a server (session.lock is locked): {world}"
+                ) from exc
+            locked = True
+        elif os.name == "nt":
+            import msvcrt as lock_module
+            fp.seek(0, os.SEEK_END)
+            if fp.tell() == 0:
+                fp.write(b"\0")
+                fp.flush()
+            fp.seek(0)
+            try:
+                lock_module.locking(fp.fileno(), lock_module.LK_NBLCK, 1)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"World appears to be open by Minecraft or a server (session.lock is locked): {world}"
+                ) from exc
+            locked = True
+        else:
+            raise RuntimeError(f"Safe world-write locking is unsupported on {os.name!r}; refusing to write.")
+        yield
+    finally:
+        if fp is not None:
+            if locked and lock_module is not None:
+                try:
+                    if os.name == "posix":
+                        lock_module.lockf(fp.fileno(), lock_module.LOCK_UN, 1, 0, os.SEEK_SET)
+                    else:
+                        fp.seek(0)
+                        lock_module.locking(fp.fileno(), lock_module.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            fp.close()
+        local_lock.release()
 
 # ---------------- Biomes / flags ----------------
 def _nbt_from_raw(raw:bytes) -> Optional[nbt.NBTFile]:
@@ -409,6 +530,44 @@ def _get_biomes(raw:bytes) -> Optional[bytes]:
         pass
     return None
 
+
+def _get_biomes16v2(raw: bytes) -> Optional[bytes]:
+    """Return GTNH's 256-entry little-endian u16 biome array, if valid."""
+    nb = _nbt_from_raw(raw)
+    if nb is None or "Level" not in nb:
+        return None
+    try:
+        tag = nb["Level"].get("Biomes16v2")
+        if isinstance(tag, nbt.TAG_Byte_Array) and len(tag.value) == 512:
+            return bytes(tag.value)
+    except Exception:
+        pass
+    return None
+
+
+def _get_biome_ids(raw: bytes) -> Set[int]:
+    """Read GTNH's authoritative Biomes16v2 array, or vanilla Biomes as fallback."""
+    nb = _nbt_from_raw(raw)
+    if nb is None or "Level" not in nb:
+        return set()
+    level = nb["Level"]
+    try:
+        extended = level.get("Biomes16v2")
+        if extended is not None:
+            if not isinstance(extended, nbt.TAG_Byte_Array) or len(extended.value) != 512:
+                return set()
+            data = bytes(extended.value)
+            return {
+                data[index] | (data[index + 1] << 8)
+                for index in range(0, len(data), 2)
+            }
+        standard = level.get("Biomes")
+        if isinstance(standard, nbt.TAG_Byte_Array) and len(standard.value) == 256:
+            return {int(value) & 0xFF for value in standard.value}
+    except Exception:
+        return set()
+    return set()
+
 def _has_entities(raw:bytes) -> Tuple[bool,bool]:
     nb = _nbt_from_raw(raw)
     if not nb: return (False, False)
@@ -421,17 +580,26 @@ def _has_entities(raw:bytes) -> Tuple[bool,bool]:
         return (False, False)
 
 def _is_void_chunk(raw:bytes) -> bool:
+    """Return true only when every legacy block ID (including Add) is zero."""
     nb = _nbt_from_raw(raw)
     if not nb: return False
     try:
         lvl = nb["Level"]
         if "Sections" not in lvl: return False
-        sections = lvl["Sections"]; saw=False
+        sections = lvl["Sections"]
+        saw = False
         for sec in sections:
-            if not isinstance(sec, nbt.TAG_Compound): continue
-            if "Blocks" not in sec: return False
-            saw=True
-            if any(b != 0 for b in sec["Blocks"].value): return False
+            if not isinstance(sec, nbt.TAG_Compound):
+                continue
+            if "Blocks" not in sec or len(sec["Blocks"].value) != 4096:
+                return False
+            saw = True
+            if any(int(b) != 0 for b in sec["Blocks"].value):
+                return False
+            if "Add" in sec:
+                add = bytes(sec["Add"].value)
+                if len(add) != 2048 or any(add):
+                    return False
         return saw
     except Exception:
         return False
@@ -474,9 +642,9 @@ def _iter_blocks_17(raw:bytes):
                     yield (lx, lz, base_y, full, meta)
 
 def _chunk_has_biome_id(raw:bytes, wanted:Set[int])->bool:
-    b=_get_biomes(raw)
-    if not b: return False
-    return any(x in wanted for x in b)
+    if not wanted:
+        return False
+    return bool(_get_biome_ids(raw) & wanted)
 
 def _chunk_entities_flags(raw:bytes, allow:Set[str], deny:Set[str])->Tuple[bool,bool]:
     nb = _nbt_from_raw(raw)
@@ -652,109 +820,146 @@ def _build_void_chunk(
     keep_tileentities: bool,
     source_raw: Optional[bytes],
     populated_flag: int = 1,
+    biome16_bytes: Optional[bytes] = None,
 ) -> bytes:
-    ents  = nbt.TAG_List(name="Entities",      type=nbt.TAG_Compound)
-    tiles = nbt.TAG_List(name="TileEntities",  type=nbt.TAG_Compound)
-    ticks = nbt.TAG_List(name="TileTicks",     type=nbt.TAG_Compound)
+    """Build a terrain-free 1.7.10 chunk while retaining non-terrain mod metadata."""
+    entities = nbt.TAG_List(name="Entities", type=nbt.TAG_Compound)
+    tile_entities = nbt.TAG_List(name="TileEntities", type=nbt.TAG_Compound)
+    tile_ticks = nbt.TAG_List(name="TileTicks", type=nbt.TAG_Compound)
+    biome16_tag = None
+    extra_level_tags = []
+    extra_root_tags = []
 
-    if source_raw and (keep_entities or keep_tileentities):
+    if source_raw:
         try:
-            src = nbt.NBTFile(buffer=io.BytesIO(source_raw))
-            lvl = src["Level"]
-            if keep_entities and "Entities" in lvl and isinstance(lvl["Entities"], nbt.TAG_List):
-                ents = lvl["Entities"]
-            if keep_tileentities and "TileEntities" in lvl and isinstance(lvl["TileEntities"], nbt.TAG_List):
-                tiles = lvl["TileEntities"]
-            if "TileTicks" in lvl and isinstance(lvl["TileTicks"], nbt.TAG_List):
-                ticks = lvl["TileTicks"]
-        except Exception:
-            pass
+            source = nbt.NBTFile(buffer=io.BytesIO(source_raw))
+            source_level = source["Level"]
+            if keep_entities and "Entities" in source_level:
+                if not isinstance(source_level["Entities"], nbt.TAG_List):
+                    raise ValueError("Level.Entities has an unexpected NBT type")
+                entities = copy.deepcopy(source_level["Entities"])
+
+            if "Biomes16v2" in source_level:
+                candidate = source_level["Biomes16v2"]
+                if not isinstance(candidate, nbt.TAG_Byte_Array) or len(candidate.value) != 512:
+                    raise ValueError("Level.Biomes16v2 must be a 512-byte array")
+                biome16_tag = copy.deepcopy(candidate)
+
+            rewritten_names = {
+                "xPos", "zPos", "LastUpdate", "InhabitedTime",
+                "TerrainPopulated", "LightPopulated", "Populated",
+                "HeightMap", "Biomes", "Biomes16v2", "Entities",
+                "TileEntities", "TileTicks", "Sections", "Voider",
+            }
+            for tag in source_level.tags:
+                if getattr(tag, "name", "") not in rewritten_names:
+                    extra_level_tags.append(copy.deepcopy(tag))
+            for tag in source.tags:
+                if getattr(tag, "name", "") != "Level":
+                    extra_root_tags.append(copy.deepcopy(tag))
+        except Exception as exc:
+            raise ValueError(f"Cannot safely preserve source chunk metadata: {exc}") from exc
+
+    if biome16_bytes is not None:
+        if len(biome16_bytes) != 512:
+            raise ValueError("Biomes16v2 override must contain exactly 512 bytes")
+        biome16_tag = nbt.TAG_Byte_Array(name="Biomes16v2")
+        biome16_tag.value = list(biome16_bytes)
 
     root = nbt.NBTFile()
-    lvl  = nbt.TAG_Compound(name="Level")
-    root.tags.append(lvl)
+    level = nbt.TAG_Compound(name="Level")
+    root.tags.append(level)
+    root.tags.extend(extra_root_tags)
 
-    lvl.tags.extend([
+    level.tags.extend([
         nbt.TAG_Int(name="xPos", value=cx_abs),
         nbt.TAG_Int(name="zPos", value=cz_abs),
         nbt.TAG_Long(name="LastUpdate", value=0),
         nbt.TAG_Long(name="InhabitedTime", value=0),
         nbt.TAG_Byte(name="TerrainPopulated", value=int(populated_flag)),
-        nbt.TAG_Byte(name="LightPopulated",   value=int(populated_flag)),
+        nbt.TAG_Byte(name="LightPopulated", value=int(populated_flag)),
     ])
 
-    hm = nbt.TAG_Int_Array(name="HeightMap")
-    hm.value = [0] * 256
-    lvl.tags.append(hm)
+    heightmap = nbt.TAG_Int_Array(name="HeightMap")
+    heightmap.value = [0] * 256
+    level.tags.append(heightmap)
 
-    if biome_bytes is not None and len(biome_bytes) == 256:
-        bio = nbt.TAG_Byte_Array(name="Biomes")
-        bio.value = list(biome_bytes)
-        lvl.tags.append(bio)
+    # GTNH's 16-bit array is authoritative when present. Do not add a
+    # contradictory vanilla Plains/Hell fallback alongside Biomes16v2.
+    if biome16_tag is None and biome_bytes is not None and len(biome_bytes) == 256:
+        biome_tag = nbt.TAG_Byte_Array(name="Biomes")
+        biome_tag.value = list(biome_bytes)
+        level.tags.append(biome_tag)
+    if biome16_tag is not None:
+        level.tags.append(biome16_tag)
 
-    lvl.tags.extend([ents, tiles, ticks])
+    level.tags.extend([entities, tile_entities, tile_ticks])
 
     sections = nbt.TAG_List(name="Sections", type=nbt.TAG_Compound)
-    lvl.tags.append(sections)
+    level.tags.append(sections)
 
-    zeros4096  = [0] * 4096
-    zeros2048  = [0] * 2048
-    skylight_ff= [0xFF] * 2048
-    sec_blocks = []
-    sec_data = []
-    sec_add = []
+    zeros4096 = [0] * 4096
+    zeros2048 = [0] * 2048
+    skylight_full = [0xFF] * 2048
+    section_blocks = []
+    section_data = []
+    section_add = []
 
     for y in range(16):
-        sec = nbt.TAG_Compound()
-        sec.tags.append(nbt.TAG_Byte(name="Y", value=y))
-
-        blk = nbt.TAG_Byte_Array(name="Blocks");     blk.value = zeros4096.copy()
-        dat = nbt.TAG_Byte_Array(name="Data");       dat.value = zeros2048.copy()
-        sky = nbt.TAG_Byte_Array(name="SkyLight");   sky.value = skylight_ff.copy()
-        bl  = nbt.TAG_Byte_Array(name="BlockLight"); bl.value = zeros2048.copy()
-
-        sec.tags.extend([blk, dat, sky, bl])
-        sections.tags.append(sec)
-        sec_blocks.append(blk)
-        sec_data.append(dat)
-        sec_add.append(None)
+        section = nbt.TAG_Compound()
+        section.tags.append(nbt.TAG_Byte(name="Y", value=y))
+        blocks = nbt.TAG_Byte_Array(name="Blocks")
+        blocks.value = zeros4096.copy()
+        data = nbt.TAG_Byte_Array(name="Data")
+        data.value = zeros2048.copy()
+        sky_light = nbt.TAG_Byte_Array(name="SkyLight")
+        sky_light.value = skylight_full.copy()
+        block_light = nbt.TAG_Byte_Array(name="BlockLight")
+        block_light.value = zeros2048.copy()
+        section.tags.extend([blocks, data, sky_light, block_light])
+        sections.tags.append(section)
+        section_blocks.append(blocks)
+        section_data.append(data)
+        section_add.append(None)
 
     if mark_void:
-        lvl.tags.append(nbt.TAG_Byte(name="Voider", value=1))
+        level.tags.append(nbt.TAG_Byte(name="Voider", value=1))
+
+    # Preserve mod-specific Level tags (e.g. GTNH POSTEA and V) that do not
+    # encode the removed block/biome/entity data.
+    level.tags.extend(extra_level_tags)
 
     if platform is not None:
-        px, pz, py, size, bid, meta = platform
+        px, pz, py, size, block_id, meta = platform
         center_cx = px // 16
         center_cz = pz // 16
         if center_cx == cx_abs and center_cz == cz_abs and 0 <= py <= 255:
             half = size // 2
             x0, z0 = px - half, pz - half
-            secY   = py // 16
-            y_in   = py % 16
+            section_y = py // 16
+            y_in_section = py % 16
             for dx in range(size):
                 for dz in range(size):
-                    wx = x0 + dx
-                    wz = z0 + dz
-                    if (wx // 16) == cx_abs and (wz // 16) == cz_abs:
-                        xl  = wx & 15
-                        zl  = wz & 15
-                        # Legacy Anvil section arrays are indexed Y-Z-X:
-                        # index = y*256 + z*16 + x.
-                        idx = (y_in * 256) + (zl * 16) + xl
-                        sec_blocks[secY].value[idx] = bid & 0xFF
-                        _nibble_set(sec_data[secY].value, idx, meta & 0x0F)
-                        high = (bid >> 8) & 0x0F
+                    world_x = x0 + dx
+                    world_z = z0 + dz
+                    if (world_x // 16) == cx_abs and (world_z // 16) == cz_abs:
+                        local_x = world_x & 15
+                        local_z = world_z & 15
+                        index = (y_in_section * 256) + (local_z * 16) + local_x
+                        section_blocks[section_y].value[index] = block_id & 0xFF
+                        _nibble_set(section_data[section_y].value, index, meta & 0x0F)
+                        high = (block_id >> 8) & 0x0F
                         if high:
-                            if sec_add[secY] is None:
+                            if section_add[section_y] is None:
                                 add_tag = nbt.TAG_Byte_Array(name="Add")
                                 add_tag.value = [0] * 2048
-                                sections[secY].tags.append(add_tag)
-                                sec_add[secY] = add_tag
-                            _nibble_set(sec_add[secY].value, idx, high)
+                                sections[section_y].tags.append(add_tag)
+                                section_add[section_y] = add_tag
+                            _nibble_set(section_add[section_y].value, index, high)
 
-    outb = io.BytesIO()
-    root.write_file(buffer=outb)
-    return outb.getvalue()
+    output = io.BytesIO()
+    root.write_file(buffer=output)
+    return output.getvalue()
 
 # ---------------- Backup-biomes helpers ----------------
 def _read_biomes_from_region(region_path: Path, idx: int) -> Optional[bytes]:
@@ -782,6 +987,27 @@ def _copy_biomes_from_backup_if_available(region_path:Path, idx:int)->Optional[b
     bak = region_path.with_suffix(region_path.suffix+".bak")
     if not bak.exists(): return None
     return _read_biomes_from_region(bak, idx)
+
+
+def _read_biomes16v2_from_region(region_path: Path, idx: int) -> Optional[bytes]:
+    try:
+        with region_path.open("rb") as fp:
+            offsets, _ = _read_header(fp)
+            entry = offsets[idx]
+            if entry == 0:
+                return None
+            off, count = _parse_loc(entry)
+            raw = _read_chunk_payload(fp, off, count)
+            return _get_biomes16v2(raw) if raw else None
+    except Exception:
+        return None
+
+
+def _copy_biomes16v2_from_backup_if_available(region_path: Path, idx: int) -> Optional[bytes]:
+    backup = region_path.with_suffix(region_path.suffix + ".bak")
+    if not backup.is_file():
+        return None
+    return _read_biomes16v2_from_region(backup, idx)
 
 # ---------------- Filters ----------------
 def _bbox_ok(cx_abs:int, cz_abs:int, bbox:Optional[Tuple[int,int,int,int]])->bool:
@@ -842,37 +1068,70 @@ def _process_region_inplace(mca:Path, dimtag:str, bbox, center, radius_blocks:in
                 # can't safely void or edit if we can't parse; skip counting as scanned
                 continue
             scanned += 1
+            parsed = _nbt_from_raw(raw)
+            if parsed is None or "Level" not in parsed:
+                if strict:
+                    raise IOError(f"Unreadable chunk NBT at {mca.name}:{idx}")
+                continue
+            level = parsed["Level"]
+            expected_coords = (cx_abs, cz_abs)
+            actual_coords = (
+                (int(level["xPos"].value), int(level["zPos"].value))
+                if "xPos" in level and "zPos" in level else None
+            )
+            if actual_coords != expected_coords:
+                if strict:
+                    raise IOError(
+                        f"Chunk coordinate mismatch at {mca.name}:{idx}: "
+                        f"found {actual_coords!r}, expected {expected_coords!r}"
+                    )
+                continue
 
             if not _should_void_chunk_by_rules(dimtag, raw, rules or _GLOBAL_RULES):
                 continue
 
             te,en = _has_entities(raw)
             if skip_if_entities and en: continue
-            if skip_if_tileentities and te: continue
+            # A TileEntity without its backing block is corrupt game state.
+            # "Keep TileEntities" therefore means leave the entire chunk intact.
+            if (skip_if_tileentities or keep_tileentities) and te: continue
 
             already_void = _is_void_chunk(raw)
             platform_needed = _platform_intersects_chunk(platform, cx_abs, cz_abs)
             if already_void and not platform_needed and not include_void:
                 continue
 
-            # Biome policy for writing the new chunk:
+            # Preserve GTNH's 16-bit biome array when present. Restore it
+            # from .mca.bak when requested and missing in the source chunk.
+            biome16_src = _get_biomes16v2(raw)
+            if biome16_src is None and restore_biomes_from_bak:
+                biome16_src = _copy_biomes16v2_from_backup_if_available(_source_region or mca, idx)
+
             biome_src = _get_biomes(raw)
-            if biome_src is None and restore_biomes_from_bak:
+            if biome_src is None and biome16_src is None and restore_biomes_from_bak:
                 biome_src = _copy_biomes_from_backup_if_available(_source_region or mca, idx)
 
             if dimtag == "region":
-                # Overworld: write Plains(1) if missing; otherwise keep existing biomes
-                biome_bytes_to_write = biome_src if (biome_src is not None and len(biome_src)==256) else bytes([PLAINS_ID]*256)
-            else:
-                # Non-overworld: preserve if present; if missing normally omit so providers refill.
-                # Cosmetic: in Nether, optionally prefill with Hell to avoid "Ocean" HUD before repopulation.
-                if biome_src is not None and len(biome_src)==256:
-                    biome_bytes_to_write = biome_src
+                # Overworld: preserve either existing biome representation;
+                # write Plains(1) only when neither representation exists.
+                if biome16_src is not None:
+                    biome_bytes_to_write = None
                 else:
-                    if nether_cosmetic_placeholder and dimtag.startswith("DIM-1/"):
-                        biome_bytes_to_write = bytes([HELL_ID]*256)
-                    else:
-                        biome_bytes_to_write = None  # provider will recompute
+                    biome_bytes_to_write = (
+                        biome_src if (biome_src is not None and len(biome_src) == 256)
+                        else bytes([PLAINS_ID] * 256)
+                    )
+            else:
+                # Non-overworld: preserve either representation; if both are
+                # missing, normally omit so the provider can recompute.
+                if biome16_src is not None:
+                    biome_bytes_to_write = None
+                elif biome_src is not None and len(biome_src) == 256:
+                    biome_bytes_to_write = biome_src
+                elif nether_cosmetic_placeholder and dimtag.startswith("DIM-1/"):
+                    biome_bytes_to_write = bytes([HELL_ID] * 256)
+                else:
+                    biome_bytes_to_write = None
 
             if dry_run:
                 changed += 1
@@ -881,7 +1140,7 @@ def _process_region_inplace(mca:Path, dimtag:str, bbox, center, radius_blocks:in
             new = _build_void_chunk(cx_abs, cz_abs, biome_bytes_to_write, mark_void,
                         platform if platform_needed else None,
                         keep_entities, keep_tileentities, raw,
-                        pop_flag)
+                        pop_flag, biome16_src)
             new_off, new_cnt = _write_chunk_payload(fp, off, cnt, new)
             _update_header(fp, idx, new_off, new_cnt)
             changed += 1
@@ -909,17 +1168,25 @@ def _process_region(mca:Path, *args, **kwargs)->Tuple[str,int,int]:
     temp = mca.with_name(f".{mca.name}.voider-{os.getpid()}-{threading.get_ident()}.tmp")
     try:
         before = mca.stat()
-        source_signature = (before.st_size, before.st_mtime_ns)
+        source_signature = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
         if temp.exists():
             temp.unlink()
         shutil.copy2(mca, temp)
         work_kwargs = dict(kwargs)
         work_kwargs["_region_coords"] = coords
         work_kwargs["_source_region"] = mca
+        copied = mca.stat()
+        copied_signature = (copied.st_dev, copied.st_ino, copied.st_size, copied.st_mtime_ns)
+        if copied_signature != source_signature:
+            raise RuntimeError(f"Region changed while its working copy was being prepared: {mca}")
         _tmp_name, scanned, changed = _process_region_inplace(temp, *args, **work_kwargs)
+        active_cancel = work_kwargs.get("cancel_event")
+        if active_cancel is not None and active_cancel.is_set():
+            raise InterruptedError(f"Cancelled before committing region {mca.name}")
         if changed:
             current = mca.stat()
-            if (current.st_size, current.st_mtime_ns) != source_signature:
+            current_signature = (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+            if current_signature != source_signature:
                 raise RuntimeError(f"Region changed concurrently; refusing replacement: {mca}")
             os.replace(temp, mca)
             _fsync_directory(mca.parent)
@@ -975,6 +1242,7 @@ def _candidate_roots()->List[Path]:
         home = Path.home()
         roots.extend([
             home/".minecraft"/"saves",
+            home/"CrucibleServers",
             home/".local"/"share"/"PrismLauncher"/"instances",
             home/".local"/"share"/"prismlauncher"/"instances",
             home/".var"/"app"/"org.prismlauncher.PrismLauncher"/"data"/"PrismLauncher"/"instances",
@@ -996,7 +1264,8 @@ def _candidate_roots()->List[Path]:
 def _looks_like_world_dir(p:Path)->bool:
     try:
         if not p.is_dir(): return False
-        if not (p/"level.dat").exists(): return False
+        p = _resolve_world_path(p)
+        if not (p/"level.dat").is_file(): return False
         region_dirs=[d for d in p.rglob("region") if d.is_dir() and d.parent.name not in ("entities","poi")]
         for r in region_dirs:
             if any(f.suffix==".mca" and f.name.startswith("r.") for f in r.iterdir()):
@@ -1009,7 +1278,9 @@ def _scan_for_worlds_under(root:Path, found:Dict[str,str], max_depth:int, cur_de
     if cur_depth > max_depth: return
     try:
         if _looks_like_world_dir(root):
-            found[str(root)] = str(root); return
+            candidate = _resolve_world_path(root)
+            found[str(candidate)] = str(candidate)
+            return
     except Exception:
         pass
     try:
@@ -1063,121 +1334,313 @@ def discover_minecraft_worlds(force_rescan:bool=False, max_depth:int=4, status_c
     return found
 
 # ---------------- Provider-safe biome reset (maintenance) ----------------
-# 12/10/2025-1
-def reset_biomes(world: Path, dims: Optional[List[str]] = None, *, progress_cb=None) -> int:
-    """
-    Strict provider-safe reset:
-      • Overworld ('region'):
-          - If Biomes missing/invalid, write Plains(1) *and* clear population flags, HeightMap, InhabitedTime.
-      • Non-Overworld:
-          - REMOVE Level.Biomes
-          - Set TerrainPopulated/LightPopulated/Populated = 0
-          - Zero HeightMap (256 ints) and set InhabitedTime = 0
-          - Always write back to force recompute.
-
-    Note: The per-chunk voider path may optionally write a Nether (Hell) placeholder to avoid "Ocean" HUD,
-    but this maintenance reset intentionally keeps provider behavior strict and does not insert placeholders.
-    Returns: total chunks written.
-    """
+def _reset_biomes_region_inplace(mca: Path, tag: str, rx: int, rz: int) -> int:
     changed = 0
-    region_dirs = _find_region_dirs(world)
-    if dims:
-        tags = {d.strip() for d in dims}
-        region_dirs = [d for d in region_dirs if _dim_tag(world, d) in tags]
+    with mca.open("r+b") as fp:
+        for idx, off, cnt in _iter_chunk_locations(fp):
+            raw = _read_chunk_payload(fp, off, cnt)
+            if not raw:
+                raise IOError(f"Unreadable chunk payload at {mca.name}:{idx}")
+            nb = _nbt_from_raw(raw)
+            if nb is None or "Level" not in nb:
+                raise IOError(f"Unreadable chunk NBT at {mca.name}:{idx}")
+            level = nb["Level"]
+            expected = (rx * 32 + idx % 32, rz * 32 + idx // 32)
+            actual = (
+                (int(level["xPos"].value), int(level["zPos"].value))
+                if "xPos" in level and "zPos" in level else None
+            )
+            if actual != expected:
+                raise IOError(f"Chunk coordinate mismatch at {mca.name}:{idx}: {actual!r} != {expected!r}")
 
-    files = []
-    for rdir in region_dirs:
-        tag = _dim_tag(world, rdir)
-        files.extend((tag, p) for p in sorted(rdir.glob("r.*.*.mca")))
+            legacy = level.get("Biomes")
+            if legacy is not None and (
+                not isinstance(legacy, nbt.TAG_Byte_Array) or len(legacy.value) != 256
+            ):
+                raise IOError(f"Malformed Level.Biomes at {mca.name}:{idx}")
+            extended = level.get("Biomes16v2")
+            if extended is not None and (
+                not isinstance(extended, nbt.TAG_Byte_Array) or len(extended.value) != 512
+            ):
+                raise IOError(f"Malformed Level.Biomes16v2 at {mca.name}:{idx}")
 
-    total_files = len(files)
-    for i, (tag, mca) in enumerate(files, 1):
-        unreadable = 0
-        with open(mca, "r+b") as fp:
-            for idx, off, cnt in _iter_chunk_locations(fp):
-                raw = _read_chunk_payload(fp, off, cnt)
-                if not raw:
-                    unreadable += 1
+            if tag == "region":
+                current = bytes(legacy.value) if legacy is not None else None
+                has_extended = extended is not None
+                if current is not None or has_extended:
                     continue
-                try:
-                    nb = nbt.NBTFile(buffer=io.BytesIO(raw))
-                    lvl = nb["Level"]
+                level.tags = [
+                    item for item in level.tags
+                    if getattr(item, "name", "") not in {"Biomes", "Biomes16v2"}
+                ]
+                biome_tag = nbt.TAG_Byte_Array(name="Biomes")
+                biome_tag.value = [PLAINS_ID] * 256
+                level.tags.append(biome_tag)
+            else:
+                level.tags = [
+                    item for item in level.tags
+                    if getattr(item, "name", "") not in {"Biomes", "Biomes16v2"}
+                ]
 
-                    # helpers
-                    def _byte(name):
-                        t = next((t for t in lvl.tags if isinstance(t, nbt.TAG_Byte) and t.name == name), None)
-                        if t: t.value = 0
-                        else: lvl.tags.append(nbt.TAG_Byte(name=name, value=0))
-
-                    def _ensure_heightmap_zero():
-                        hm = next((t for t in lvl.tags if isinstance(t, nbt.TAG_Int_Array) and t.name == "HeightMap"), None)
-                        if hm:
-                            hm.value = [0]*256
-                        else:
-                            arr = nbt.TAG_Int_Array(name="HeightMap"); arr.value = [0]*256
-                            lvl.tags.append(arr)
-
-                    def _reset_common_flags():
-                        _byte("TerrainPopulated")
-                        _byte("LightPopulated")
-                        _byte("Populated")  # older field some mods still observe
-                        _ensure_heightmap_zero()
-                        # Reset InhabitedTime for good measure (affects some population heuristics)
-                        it = next((t for t in lvl.tags if isinstance(t, nbt.TAG_Long) and t.name == "InhabitedTime"), None)
-                        if it: it.value = 0
-                        else:  lvl.tags.append(nbt.TAG_Long(name="InhabitedTime", value=0))
-
-                    if tag == "region":
-                        cur = None
-                        if "Biomes" in lvl and isinstance(lvl["Biomes"], nbt.TAG_Byte_Array):
-                            cur = bytes(lvl["Biomes"].value)
-                        need = (cur is None or len(cur) != 256)
-                        if need:
-                            # replace Biomes with Plains(1) and clear flags
-                            lvl.tags = [t for t in lvl.tags if getattr(t, "name", "") != "Biomes"]
-                            lvl.tags.append(nbt.TAG_Byte_Array(name="Biomes", value=[PLAINS_ID]*256))
-                            _reset_common_flags()
-                            outb = io.BytesIO(); nb.write_file(buffer=outb)
-                            new_off, new_cnt = _write_chunk_payload(fp, off, cnt, outb.getvalue())
-                            _update_header(fp, idx, new_off, new_cnt)
-                            changed += 1
-                        # else: already valid Biomes; leave Overworld alone
-                    else:
-                        # Non-overworld strict drop
-                        lvl.tags = [t for t in lvl.tags if getattr(t, "name", "") != "Biomes"]
-                        _reset_common_flags()
-                        outb = io.BytesIO(); nb.write_file(buffer=outb)
-                        new_off, new_cnt = _write_chunk_payload(fp, off, cnt, outb.getvalue())
-                        _update_header(fp, idx, new_off, new_cnt)
-                        changed += 1
-
-                except Exception:
-                    unreadable += 1
-                    continue
-
-        if progress_cb:
-            progress_cb(i, total_files, f"{tag}: {mca.name} (unreadable={unreadable})")
-
+            reset_names = {"TerrainPopulated", "LightPopulated", "Populated", "HeightMap", "InhabitedTime"}
+            level.tags = [item for item in level.tags if getattr(item, "name", "") not in reset_names]
+            heightmap = nbt.TAG_Int_Array(name="HeightMap")
+            heightmap.value = [0] * 256
+            level.tags.extend([
+                nbt.TAG_Byte(name="TerrainPopulated", value=0),
+                nbt.TAG_Byte(name="LightPopulated", value=0),
+                nbt.TAG_Byte(name="Populated", value=0),
+                heightmap,
+                nbt.TAG_Long(name="InhabitedTime", value=0),
+            ])
+            output = io.BytesIO()
+            nb.write_file(buffer=output)
+            new_off, new_count = _write_chunk_payload(fp, off, cnt, output.getvalue())
+            _update_header(fp, idx, new_off, new_count)
+            changed += 1
     return changed
+
+
+def reset_biomes(world: Path, dims: Optional[List[str]] = None, *, progress_cb=None) -> int:
+    """Safely reset selected biome metadata with a full verified backup and rollback staging."""
+    world = _resolve_world_path(world)
+    if not world.is_dir() or not (world / "level.dat").is_file():
+        raise ValueError(f"Not a Minecraft world folder: {world}")
+    region_dirs = _find_region_dirs(world)
+    requested = {item.strip() for item in dims} if dims is not None else None
+    if requested is not None:
+        available = {_dim_tag(world, directory) for directory in region_dirs}
+        unknown = requested - available
+        if unknown:
+            raise ValueError(f"Unknown dimension tag(s): {', '.join(sorted(unknown))}")
+        region_dirs = [directory for directory in region_dirs if _dim_tag(world, directory) in requested]
+    files = [
+        (_dim_tag(world, directory), path, _region_coords_from_name(path))
+        for directory in region_dirs
+        for path in sorted(directory.glob("r.*.*.mca"))
+    ]
+    if not files:
+        raise RuntimeError("No region files found in the selected biome-reset scope.")
+
+    with _world_write_guard(world):
+        backup = _backup_world_zip(world)
+        staged = []
+        committed = []
+        changed = 0
+        try:
+            # Stage every output first. A malformed chunk aborts before any
+            # original region file is replaced.
+            for index, (tag, mca, (rx, rz)) in enumerate(files, 1):
+                before = mca.stat()
+                signature = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                temp = mca.with_name(
+                    f".{mca.name}.voider-biome-{os.getpid()}-{threading.get_ident()}.tmp"
+                )
+                temp.unlink(missing_ok=True)
+                shutil.copy2(mca, temp)
+                try:
+                    file_changed = _reset_biomes_region_inplace(temp, tag, rx, rz)
+                    staged.append((mca, temp, signature, file_changed))
+                    changed += file_changed
+                    if progress_cb:
+                        progress_cb(index, len(files), f"Staged {tag}: {mca.name} ({file_changed} chunk(s))")
+                except BaseException:
+                    temp.unlink(missing_ok=True)
+                    raise
+
+            for mca, temp, signature, file_changed in staged:
+                if not file_changed:
+                    temp.unlink(missing_ok=True)
+                    continue
+                current = mca.stat()
+                current_signature = (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+                if current_signature != signature:
+                    raise RuntimeError(f"Region changed during biome reset; refusing replacement: {mca}")
+                rollback = mca.with_name(
+                    f".{mca.name}.voider-rollback-{os.getpid()}-{threading.get_ident()}"
+                )
+                if rollback.exists():
+                    raise RuntimeError(f"Refusing to overwrite an existing rollback file: {rollback}")
+                try:
+                    shutil.copy2(mca, rollback)
+                    os.replace(temp, mca)
+                except BaseException:
+                    rollback.unlink(missing_ok=True)
+                    raise
+                # Record the replacement before any operation that might fail,
+                # including the durability barrier, so the outer exception path
+                # can always restore the original region.
+                committed.append((mca, rollback))
+                _fsync_directory(mca.parent)
+
+            audit = verify_world(world)
+            if not audit["ok"]:
+                raise RuntimeError(
+                    f"Post-reset verifier found {len(audit['errors'])} error(s): "
+                    + "; ".join(audit["errors"][:5])
+                )
+            for _mca, rollback in committed:
+                try:
+                    rollback.unlink(missing_ok=True)
+                except OSError as cleanup_exc:
+                    print(
+                        f"[warning] Biome reset succeeded but could not remove rollback file "
+                        f"{rollback}: {cleanup_exc}",
+                        file=sys.stderr,
+                    )
+            return changed
+        except BaseException as exc:
+            for mca, rollback in reversed(committed):
+                try:
+                    if rollback.exists():
+                        os.replace(rollback, mca)
+                        _fsync_directory(mca.parent)
+                except OSError as restore_exc:
+                    print(f"[critical] rollback failed for {mca}: {restore_exc}", file=sys.stderr)
+            for _mca, temp, _signature, _count in staged:
+                temp.unlink(missing_ok=True)
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise RuntimeError(
+                f"Biome reset failed; changes were rolled back where possible. "
+                f"Keep the verified backup for recovery: {backup}"
+            ) from exc
 
 # ---------------- Backups ----------------
 def _backup_world_zip(world:Path):
-    stamp=time.strftime("%Y%m%d-%H%M%S")
-    z=world.parent/f"{world.name}.void-backup-{stamp}.zip"
-    serial=1
-    while z.exists():
-        z=world.parent/f"{world.name}.void-backup-{stamp}-{serial}.zip"; serial+=1
-    with ZipFile(z,"w",ZIP_DEFLATED) as zf:
-        for root,_,files in os.walk(world):
-            for nm in files:
-                p=Path(root)/nm; zf.write(p, arcname=str(p.relative_to(world)))
-    with ZipFile(z,"r") as zf:
-        bad=zf.testzip()
-        if bad:
-            raise IOError(f"Backup verification failed at {bad}")
-    digest=hashlib.sha256(z.read_bytes()).hexdigest()
-    print(f"World backup created and verified: {z.name} (SHA-256 {digest})")
-    return z
+    """Create a complete, hash-manifested ZIP backup and verify every member."""
+    world = Path(world).expanduser().resolve()
+    if not world.is_dir() or not (world / "level.dat").is_file():
+        raise ValueError(f"Not a Minecraft world folder: {world}")
+    manifest_name = ".voider-backup-manifest.json"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    destination = world.parent / f"{world.name}.void-backup-{stamp}.zip"
+    serial = 1
+    while destination.exists():
+        destination = world.parent / f"{world.name}.void-backup-{stamp}-{serial}.zip"
+        serial += 1
+    if (world / manifest_name).exists():
+        raise RuntimeError(f"World contains reserved backup-manifest path: {manifest_name}")
+
+    def inventory():
+        result = {}
+        for root, directories, filenames in os.walk(world, followlinks=False):
+            root_path = Path(root)
+            for name in list(directories):
+                item = root_path / name
+                if item.is_symlink():
+                    raise RuntimeError(f"World backup refuses symlinked directory: {item}")
+            for name in filenames:
+                item = root_path / name
+                if item.is_symlink():
+                    raise RuntimeError(f"World backup refuses symlinked file: {item}")
+                relative = item.relative_to(world).as_posix()
+                if relative == "session.lock":
+                    # This is an ephemeral OS byte-range lock, not world
+                    # content. Windows denies reads of the locked byte range
+                    # while the write guard is held. Minecraft recreates it.
+                    continue
+                metadata = item.stat(follow_symlinks=False)
+                if not statmod.S_ISREG(metadata.st_mode):
+                    raise RuntimeError(f"World backup refuses non-regular file: {item}")
+                result[relative] = (
+                    metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns
+                )
+        return result
+
+    def digest_stream(stream):
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            block = stream.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+            size += len(block)
+        return digest.hexdigest(), size
+
+    before = inventory()
+    if "level.dat" not in before:
+        raise RuntimeError("World backup inventory does not contain level.dat")
+    temporary = destination.with_name(
+        f".{destination.name}.partial-{os.getpid()}-{threading.get_ident()}"
+    )
+    file_manifest = {}
+    try:
+        with ZipFile(temporary, "x", ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+            for relative in sorted(before):
+                source = world / Path(relative)
+                digest = hashlib.sha256()
+                size = 0
+                info = zipfile.ZipInfo(relative)
+                info.compress_type = ZIP_DEFLATED
+                with source.open("rb") as input_stream, archive.open(info, "w") as output_stream:
+                    while True:
+                        block = input_stream.read(1024 * 1024)
+                        if not block:
+                            break
+                        output_stream.write(block)
+                        digest.update(block)
+                        size += len(block)
+                file_manifest[relative] = {"size": size, "sha256": digest.hexdigest()}
+            manifest = {
+                "format": "gtnh-world-voider-backup-v1",
+                "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "world_name": world.name,
+                "file_count": len(file_manifest),
+                "excluded_files": {
+                    "session.lock": "Transient operating-system lock; recreated by Minecraft on world open."
+                },
+                "files": file_manifest,
+            }
+            archive.writestr(
+                manifest_name,
+                json.dumps(manifest, sort_keys=True, indent=2).encode("utf-8"),
+                compress_type=ZIP_DEFLATED,
+            )
+
+        after = inventory()
+        if after != before:
+            raise RuntimeError("World files changed during backup; backup is not a consistent snapshot")
+
+        with ZipFile(temporary, "r") as archive:
+            bad_member = archive.testzip()
+            if bad_member:
+                raise IOError(f"Backup CRC verification failed at {bad_member}")
+            expected_members = set(before) | {manifest_name}
+            names = archive.namelist()
+            if len(names) != len(expected_members) or set(names) != expected_members:
+                raise IOError("Backup member inventory does not match the world inventory")
+            loaded_manifest = json.loads(archive.read(manifest_name).decode("utf-8"))
+            if loaded_manifest.get("format") != "gtnh-world-voider-backup-v1":
+                raise IOError("Backup manifest format is invalid")
+            if set(loaded_manifest.get("files", {})) != set(before):
+                raise IOError("Backup manifest file list is incomplete")
+            for relative, expected in file_manifest.items():
+                with archive.open(relative, "r") as stream:
+                    actual_hash, actual_size = digest_stream(stream)
+                if actual_size != expected["size"] or actual_hash != expected["sha256"]:
+                    raise IOError(f"Backup SHA-256 verification failed for {relative}")
+                with (world / Path(relative)).open("rb") as source_stream:
+                    source_hash, source_size = digest_stream(source_stream)
+                if source_size != actual_size or source_hash != actual_hash:
+                    raise RuntimeError(f"World changed while backup was being verified: {relative}")
+
+        if inventory() != before:
+            raise RuntimeError("World inventory changed after backup verification")
+        # Open read/write so Windows' _commit() path has a writable handle.
+        with temporary.open("r+b") as fp:
+            os.fsync(fp.fileno())
+        os.replace(temporary, destination)
+        _fsync_directory(destination.parent)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+    with destination.open("rb") as stream:
+        digest, _size = digest_stream(stream)
+    print(f"World backup created and SHA-256 verified: {destination} ({digest})")
+    return destination
 
 def _per_file_backup(world:Path):
     for rdir in _find_region_dirs(world):
@@ -1210,6 +1673,10 @@ def verify_world(world:Path)->Dict[str, object]:
                 with mca.open("rb") as fp:
                     offsets, _ = _read_header(fp)
                     fp.seek(0, os.SEEK_END); file_size = fp.tell()
+                    if file_size < 2 * SECTOR_BYTES or file_size % SECTOR_BYTES:
+                        file_errors.append(
+                            f"{mca.name}: region file size is not a positive whole number of sectors: {file_size}"
+                        )
                     occupied: Set[int] = set()
                     for idx, entry in enumerate(offsets):
                         if not entry: continue
@@ -1297,7 +1764,8 @@ class HelpDialog:
         "Options (hover for short; hold Shift while hovering for more details & examples):\n"
         " • Dry run — Does NOT write files. Shows how many chunks would be voided.\n"
         " • Include already void — Also rewrites chunks that are already empty.\n"
-        " • Keep Entities/TileEntities — Preserve from source chunk.\n"
+        " • Keep Entities — Copy entity records to the new chunk.\n"
+        " • Keep TileEntities — Leave any chunk containing TileEntities untouched.\n"
         " • Skip if Entities/TileEntities — Skip chunks that contain any.\n"
         " • Mark Void tag — Adds Level.Voider=1 to new chunks.\n"
         " • Restore Biomes from .bak — If Biomes are missing, try copying from .mca.bak.\n"
@@ -1311,7 +1779,7 @@ class HelpDialog:
         "Rules (.voider-rules.json):\n"
         " • Whitelists require a match; blacklists block unless whitelisted.\n"
         " • Blocks — Prefer numeric IDs (1.7.x). Entities — 'minecraft:zombie', 'TwilightForest.minotaur'.\n"
-        " • Biomes — numeric 0..255.\n\n"
+        " • Biomes — numeric 0..65535.\n\n"
         "NEI Dump Import:\n"
         " • Auto-scans your instance for a recent NEI “Dump ID Map” and loads it for the Rules Editor.\n\n"
         "Tips:\n"
@@ -1393,7 +1861,7 @@ class RulesEditorDialog:
 
         blw = mk_editor(2, "Blocks (numeric IDs preferred in 1.7) — one per line")
         bew = mk_editor(3, "Entities (minecraft:zombie, TwilightForest.minotaur) — one per line")
-        bmw = mk_editor(4, "Biome IDs (0..255) — one per line")
+        bmw = mk_editor(4, "Biome IDs (0..65535) — one per line")
 
         def mk_text(lf, title):
             import tkinter as tk
@@ -1423,7 +1891,7 @@ class RulesEditorDialog:
         Tooltip(self.entity_blacklist_txt, "Entities that prevent voiding unless whitelisted.",
                 "If a chunk contains a blacklisted entity and it isn’t whitelisted, the chunk will be skipped.")
         Tooltip(self.biome_whitelist_txt, "Biomes that allow voiding when present.",
-                "Enter numeric biome IDs (0–255).")
+                "Enter numeric biome IDs (0–65535).")
         Tooltip(self.biome_blacklist_txt, "Biomes that prevent voiding.",
                 "If any of these biome IDs are present, the chunk is skipped (unless also whitelisted).")
 
@@ -1577,8 +2045,8 @@ class VoiderStatusUI:
                 "Useful to re-tag voided chunks or rebuild platform.")
         add_chk("Keep Entities", self.keep_entities, "Copy Level.Entities from source.",
                 "Use with caution; can preserve spawns or players.")
-        add_chk("Keep TileEntities", self.keep_tes, "Copy Level.TileEntities from source.",
-                "Keeps chests, machines, etc.")
+        add_chk("Keep TileEntities", self.keep_tes, "Leave chunks with TileEntities untouched.",
+                "TileEntities require their backing blocks. Enabling this skips those chunks rather than copying orphaned chests or machines into empty terrain.")
         add_chk("Skip if Entities", self.skip_entities, "Skip chunks that contain any Entities.",
                 "Safety.")
         add_chk("Skip if TileEntities", self.skip_tes, "Skip chunks that contain any TileEntities.",
@@ -1633,54 +2101,103 @@ class VoiderStatusUI:
         self._pump()
 
     # ---- Menu handlers ----
+    def _run_biome_reset(self, world: Path, dims: Optional[List[str]], description: str):
+        from tkinter import messagebox
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showwarning("Operation already running", "Wait for the current world operation to finish.")
+            return
+        if dims is not None and not dims:
+            messagebox.showinfo("No dimensions", "There are no non-Overworld dimensions to reset.")
+            return
+        scope = "all detected dimensions" if dims is None else ", ".join(dims)
+        approved = messagebox.askyesno(
+            "Confirm biome reset",
+            f"{description}\n\nWorld: {world}\nScope: {scope}\n\n"
+            "This changes chunk biome/population metadata. A full verified ZIP backup "
+            "will be created first. The Minecraft client/server must be stopped. Continue?",
+            parent=self.tk,
+        )
+        if not approved:
+            return
+
+        self.btn_start.configure(state="disabled")
+        self.btn_cancel.configure(state="disabled")
+        self._set_status("Preparing biome reset and verified backup…")
+
+        def run():
+            try:
+                def progress(done, total, line):
+                    pct = int((done / total) * 100) if total else 0
+                    print(f"{pct}% — {line}")
+                    self._set_progress(pct)
+                    self._set_status(f"{description}: {pct}% — {line}")
+
+                count = reset_biomes(world, dims, progress_cb=progress)
+                print(f"Biome reset complete: changed {count} chunk(s).")
+                self._set_status(f"Biome reset complete: {count} chunk(s) changed.")
+            except Exception as exc:
+                print(f"[error] Biome reset failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+                self._set_status(f"Biome reset failed: {exc}")
+            finally:
+                def restore_controls():
+                    self.btn_start.configure(state="normal")
+                    self.btn_cancel.configure(state="disabled")
+                self._ui_call(restore_controls)
+
+        self.worker_thread = threading.Thread(target=run, daemon=True)
+        self.worker_thread.start()
+
     def _menu_reset_all_dims(self):
         from tkinter import messagebox
-        wp=self.world_var.get().strip()
-        if not wp or not (Path(wp)/"level.dat").exists():
-            messagebox.showwarning("Pick a world","Select a valid world first.")
+        selected = self.world_var.get().strip()
+        try:
+            world = _resolve_world_path(Path(selected)) if selected else None
+        except Exception as exc:
+            messagebox.showerror("Invalid world", str(exc), parent=self.tk)
             return
-        def run():
-            self._set_status("Resetting biomes (ALL dims, provider-safe)…")
-            def prog(done,total,line):
-                pct=int((done/total)*100) if total else 0
-                print(f"{pct}% — {line}")
-                self._set_progress(pct)
-            n=reset_biomes(Path(wp), None, progress_cb=prog)
-            print(f"Reset biomes in {n} chunk(s). Providers will refill on next load.")
-            self._set_status("Idle.")
-        threading.Thread(target=run, daemon=True).start()
+        if world is None or not (world / "level.dat").is_file():
+            messagebox.showwarning("Pick a world", "Select a valid world or dedicated-server instance first.", parent=self.tk)
+            return
+        self.world_var.set(str(world))
+        self._run_biome_reset(world, None, "Reset biome metadata in all dimensions")
 
     def _menu_reset_non_overworld(self):
         from tkinter import messagebox
-        wp=self.world_var.get().strip()
-        if not wp or not (Path(wp)/"level.dat").exists():
-            messagebox.showwarning("Pick a world","Select a valid world first.")
+        selected = self.world_var.get().strip()
+        try:
+            world = _resolve_world_path(Path(selected)) if selected else None
+        except Exception as exc:
+            messagebox.showerror("Invalid world", str(exc), parent=self.tk)
             return
-        w=Path(wp)
-        dims=[_dim_tag(w, d) for d in _find_region_dirs(w) if _dim_tag(w,d)!="region"]
-        def run():
-            self._set_status("Resetting biomes (non-overworld, provider-safe)…")
-            def prog(done,total,line):
-                pct=int((done/total)*100) if total else 0
-                print(f"{pct}% — {line}")
-                self._set_progress(pct)
-            n=reset_biomes(w, dims, progress_cb=prog)
-            print(f"Reset biomes in {n} chunk(s). Providers will refill on next load.")
-            self._set_status("Idle.")
-        threading.Thread(target=run, daemon=True).start()
+        if world is None or not (world / "level.dat").is_file():
+            messagebox.showwarning("Pick a world", "Select a valid world or dedicated-server instance first.", parent=self.tk)
+            return
+        self.world_var.set(str(world))
+        dims = [
+            _dim_tag(world, directory)
+            for directory in _find_region_dirs(world)
+            if _dim_tag(world, directory) != "region"
+        ]
+        self._run_biome_reset(world, dims, "Reset biome metadata outside the Overworld")
 
     # ---- Buttons / actions ----
     def _open_help(self): HelpDialog(self.tk)
 
     def _open_rules(self):
         from tkinter import messagebox
-        world = self.world_var.get().strip()
-        if not world or not (Path(world)/"level.dat").exists():
-            messagebox.showwarning("Pick a world", "Select a valid world first.")
+        selected = self.world_var.get().strip()
+        try:
+            world = _resolve_world_path(Path(selected)) if selected else None
+        except Exception as exc:
+            messagebox.showerror("Invalid world", str(exc))
             return
-        dims = [_dim_tag(Path(world), d) for d in _find_region_dirs(Path(world))]
-        rules = _load_rules(Path(world))
-        RulesEditorDialog(self.tk, Path(world), rules, dims, self.nei_autoload)
+        if world is None or not (world/"level.dat").is_file():
+            messagebox.showwarning("Pick a world", "Select a valid world or dedicated-server instance first.")
+            return
+        self.world_var.set(str(world))
+        dims = [_dim_tag(world, d) for d in _find_region_dirs(world)]
+        rules = _load_rules(world)
+        RulesEditorDialog(self.tk, world, rules, dims, self.nei_autoload)
 
     def _toggle_console(self):
         vis = self.console_visible.get()
@@ -1715,13 +2232,16 @@ class VoiderStatusUI:
 
     def _browse_world(self):
         from tkinter import filedialog, messagebox
-        p=filedialog.askdirectory(title="Pick a world folder (must contain level.dat)")
+        p=filedialog.askdirectory(title="Pick a world folder or dedicated-server instance")
         if p:
-            if (Path(p)/"level.dat").exists():
-                self.world_var.set(p)
-                self._prime_nei(Path(p))
-            else:
-                messagebox.showerror("Invalid world","Selected folder does not contain level.dat")
+            try:
+                world = _resolve_world_path(Path(p))
+                if not (world / "level.dat").is_file():
+                    raise ValueError("Selected folder has neither level.dat nor a valid server.properties level-name world.")
+                self.world_var.set(str(world))
+                self._prime_nei(world)
+            except Exception as exc:
+                messagebox.showerror("Invalid world", str(exc))
 
     def _discover_worlds(self):
         def bg():
@@ -1765,8 +2285,15 @@ class VoiderStatusUI:
     def _start_voiding(self):
         if self.worker_thread and self.worker_thread.is_alive(): return
         wp=self.world_var.get().strip()
-        if not wp or not (Path(wp)/"level.dat").exists():
-            self._set_status("Pick a valid world first."); return
+        try:
+            wp = str(_resolve_world_path(Path(wp))) if wp else ""
+        except Exception as exc:
+            self._set_status(f"Invalid world: {exc}")
+            return
+        if not (Path(wp) / "level.dat").is_file():
+            self._set_status("Pick a valid world folder or server instance first.")
+            return
+        self.world_var.set(wp)
         self.args.world = wp
         self.args.dry_run = self.dry.get()
         self.args.include_void = self.include_void.get()
@@ -1794,14 +2321,25 @@ class VoiderStatusUI:
                 rules_local = _load_rules(world)
 
                 sel_path = world/".voider-selection.json"
-                sel_include: Dict[str, Set[Tuple[int,int]]] = {}
-                sel_exclude: Dict[str, Set[Tuple[int,int]]] = {}
-                if sel_path.exists():
-                    try:
-                        sel_include, sel_exclude = _load_selection(sel_path)
-                        print(f"Loaded selection from {sel_path.name}")
-                    except Exception as e:
-                        print(f"[warn] Failed to read selection JSON: {e!r}")
+                if not sel_path.is_file():
+                    raise RuntimeError(
+                        "No saved chunk selection exists. Open Chunk Selector and save a selection; "
+                        "whole-world processing is available only through the explicit CLI --all-chunks option."
+                    )
+                try:
+                    sel_include, sel_exclude = _load_selection(sel_path)
+                except Exception as exc:
+                    raise RuntimeError(f"Refusing to run with an invalid selection file: {exc}") from exc
+                self.args.selection_scope = set(sel_include) | set(sel_exclude)
+                if not self.args.selection_scope:
+                    raise RuntimeError(
+                        "The saved selection contains no dimension scopes. Save a selection or explicitly "
+                        "authorize all chunks through the headless CLI."
+                    )
+                print(
+                    f"Loaded selection from {sel_path.name}; authorized dimensions: "
+                    + ", ".join(sorted(self.args.selection_scope))
+                )
 
                 prog_lock=threading.Lock()
                 def prog_cb(done, total, line):
@@ -1848,6 +2386,9 @@ class VoiderStatusUI:
                        if self.args.dry_run else
                        f"Done. Voided {total_changed} chunk(s) out of {total_scanned} scanned. Biomes provider-safe.")
                 print(msg); self._set_status("Idle.")
+            except Exception as exc:
+                print(f"[error] Voider operation failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+                self._set_status(f"Voider operation failed: {exc}")
             finally:
                 self._set_running(False)
 
@@ -1965,7 +2506,7 @@ def choose_world_gui(discovered:Dict[str,str]) -> Optional[str]:
     return sel_path["v"]
 
 # ---------------- Orchestration ----------------
-def run_voider(world:Path,
+def _run_voider_unlocked(world:Path,
                sel_include_by_dim:Dict[str, Set[Tuple[int,int]]],
                sel_exclude_by_dim:Dict[str, Set[Tuple[int,int]]],
                args,
@@ -1977,6 +2518,9 @@ def run_voider(world:Path,
     """
     Returns: (total_scanned, total_changed)
     """
+    cancel_event = cancel_event or threading.Event()
+    if cancel_event.is_set():
+        raise InterruptedError("Voider operation was already cancelled.")
     platform=None
     if args.platform_x is not None and args.platform_z is not None:
         size=int(args.platform_size)
@@ -1989,9 +2533,28 @@ def run_voider(world:Path,
     only=[s.strip() for s in args.only.split(",")] if args.only else None
     exclude=[s.strip() for s in args.exclude.split(",")] if args.exclude else None
 
-    region_dirs=_find_region_dirs(world)
-    if only:   region_dirs=[d for d in region_dirs if _dim_tag(world,d) in only]
-    if exclude:region_dirs=[d for d in region_dirs if _dim_tag(world,d) not in exclude]
+    region_dirs = _find_region_dirs(world)
+    selection_scope = getattr(args, "selection_scope", None)
+    if selection_scope is not None:
+        selection_scope = set(selection_scope)
+        available_tags = {_dim_tag(world, directory) for directory in region_dirs}
+        unknown_tags = selection_scope - available_tags
+        if unknown_tags:
+            raise ValueError(
+                "Selection refers to missing dimension(s): " + ", ".join(sorted(unknown_tags))
+            )
+        if not selection_scope:
+            raise ValueError(
+                "Selection authorizes no dimensions. Use an explicit selection or --all-chunks."
+            )
+        region_dirs = [
+            directory for directory in region_dirs
+            if _dim_tag(world, directory) in selection_scope
+        ]
+    if only:
+        region_dirs = [d for d in region_dirs if _dim_tag(world, d) in only]
+    if exclude:
+        region_dirs = [d for d in region_dirs if _dim_tag(world, d) not in exclude]
 
     bbox=None
     if args.bbox:
@@ -2002,15 +2565,13 @@ def run_voider(world:Path,
 
     total_scanned=0; total_changed=0
 
-    if not args.dry_run:
-        _assert_world_not_active(world)
-
-    if args.backup and not args.dry_run:
+    backup_path = None
+    if not args.dry_run and args.backup:
         if status_cb: status_cb("Creating world ZIP backup…")
-        before_backup=_region_snapshot(world)
-        _backup_world_zip(world)
+        before_backup = _region_snapshot(world)
+        backup_path = _backup_world_zip(world)
         if _region_snapshot(world) != before_backup:
-            raise RuntimeError("World region files changed during backup; close Minecraft and retry")
+            raise RuntimeError(f"World region files changed during backup; verified archive retained at {backup_path}")
     if args.per_file_backup and not args.dry_run:
         if status_cb: status_cb("Creating per-file .bak copies…")
         _per_file_backup(world)
@@ -2037,7 +2598,7 @@ def run_voider(world:Path,
             include_void=bool(args.include_void), platform=platform,
             keep_entities=bool(args.keep_entities), keep_tileentities=bool(args.keep_tileentities),
             skip_if_entities=bool(args.skip_if_entities), skip_if_tileentities=bool(args.skip_if_tileentities),
-            mark_void=bool(args.mark_void), dry_run=bool(args.dry_run), strict=False,
+            mark_void=bool(args.mark_void), dry_run=bool(args.dry_run), strict=True,
             sel_include=inc_set, sel_exclude=exc_set, restore_biomes_from_bak=bool(args.restore_biomes),
             nether_cosmetic_placeholder=bool(args.nether_cosmetic_placeholder),
             rules=rules,
@@ -2047,36 +2608,90 @@ def run_voider(world:Path,
         print(f"  {line}")
         return scanned, changed, dimtag, line
 
-    done_files=0
-    if args.workers and int(args.workers)>1:
-        max_workers=max(1,int(args.workers))
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futs=[ex.submit(_work, dimtag, mca) for (dimtag, mca) in file_list]
-            for fut in as_completed(futs):
-                if cancel_event is not None and cancel_event.is_set(): break
+    done_files = 0
+    failures = []
+    if args.workers and int(args.workers) > 1:
+        max_workers = max(1, int(args.workers))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_paths = {
+                executor.submit(_work, dimtag, mca): mca
+                for dimtag, mca in file_list
+            }
+            for future in as_completed(future_paths):
+                mca = future_paths[future]
                 try:
-                    scanned, changed, dimtag, line = fut.result()
-                    total_scanned += scanned; total_changed += changed
+                    scanned, changed, _dimtag, line = future.result()
+                    total_scanned += scanned
+                    total_changed += changed
                     done_files += 1
-                    if progress_cb: progress_cb(done_files, total_files, line)
-                except Exception as e:
-                    print(f"  [skip] worker exception - {e!r}", file=sys.stderr)
+                    if progress_cb:
+                        progress_cb(done_files, total_files, line)
+                except InterruptedError:
+                    continue
+                except Exception as exc:
+                    failures.append(f"{mca}: {type(exc).__name__}: {exc}")
+                    if cancel_event is not None:
+                        cancel_event.set()
     else:
         grouped: Dict[str, List[Path]] = {}
-        for dimtag, mca in file_list: grouped.setdefault(dimtag,[]).append(mca)
+        for dimtag, mca in file_list:
+            grouped.setdefault(dimtag, []).append(mca)
         for dimtag, files in grouped.items():
             print(f"Processing {len(files)} region files in '{dimtag}'...")
             for mca in files:
-                if cancel_event is not None and cancel_event.is_set(): break
+                if cancel_event is not None and cancel_event.is_set():
+                    break
                 try:
-                    scanned, changed, _, line = _work(dimtag, mca)
-                    total_scanned += scanned; total_changed += changed
+                    scanned, changed, _dimtag, line = _work(dimtag, mca)
+                    total_scanned += scanned
+                    total_changed += changed
                     done_files += 1
-                    if progress_cb: progress_cb(done_files, total_files, line)
-                except Exception as e:
-                    print(f"  [skip] {mca.name} - {e!r}", file=sys.stderr)
+                    if progress_cb:
+                        progress_cb(done_files, total_files, line)
+                except InterruptedError:
+                    break
+                except Exception as exc:
+                    failures.append(f"{mca}: {type(exc).__name__}: {exc}")
+                    if cancel_event is not None:
+                        cancel_event.set()
+                    break
 
+    if failures:
+        detail = "; ".join(failures[:5])
+        extra = f" Verified recovery backup: {backup_path}" if backup_path else " No backup was created."
+        raise RuntimeError(
+            f"Voider did not complete: {len(failures)} region failure(s). {detail}.{extra}"
+        )
+    if cancel_event is not None and cancel_event.is_set():
+        extra = f" Verified recovery backup: {backup_path}" if backup_path else " No backup was created."
+        raise RuntimeError(
+            f"Voider was cancelled. Previously committed region files may have changed;{extra}"
+        )
     return total_scanned, total_changed
+
+def run_voider(world:Path,
+               sel_include_by_dim:Dict[str, Set[Tuple[int,int]]],
+               sel_exclude_by_dim:Dict[str, Set[Tuple[int,int]]],
+               args,
+               *,
+               progress_cb:Optional[Callable[[int,int,str],None]]=None,
+               status_cb:Optional[Callable[[str],None]]=None,
+               rules:Optional[AllRules]=None,
+               cancel_event:Optional[threading.Event]=None)->Tuple[int,int]:
+    """Run a read-only preview or a write protected by a held session.lock."""
+    world = _resolve_world_path(Path(world))
+    if args.dry_run:
+        return _run_voider_unlocked(
+            world, sel_include_by_dim, sel_exclude_by_dim, args,
+            progress_cb=progress_cb, status_cb=status_cb, rules=rules,
+            cancel_event=cancel_event,
+        )
+    with _world_write_guard(world):
+        return _run_voider_unlocked(
+            world, sel_include_by_dim, sel_exclude_by_dim, args,
+            progress_cb=progress_cb, status_cb=status_cb, rules=rules,
+            cancel_event=cancel_event,
+        )
 
 # ---------------- CLI / GUI ----------------
 def main()->bool:
@@ -2113,7 +2728,8 @@ def main()->bool:
     ap.add_argument("--skip-if-entities", action="store_true", help="Skip chunks with Entities")
     ap.add_argument("--skip-if-tileentities", action="store_true", help="Skip chunks with TileEntities")
     ap.add_argument("--keep-entities", action="store_true", help="Preserve Entities (copy through)")
-    ap.add_argument("--keep-tileentities", action="store_true", help="Preserve TileEntities (copy through)")
+    ap.add_argument("--keep-tileentities", action="store_true",
+                    help="Preserve chunks with TileEntities intact by skipping them")
     ap.add_argument("--mark-void", action="store_true", help="Mark voided chunks with a Voider tag")
     ap.add_argument("--preset", choices=tuple(PRESETS), default="manual",
                     help="Named option bundle: safe-void, full-void, preserve-data, or manual")
@@ -2147,10 +2763,15 @@ def main()->bool:
 
     args=ap.parse_args()
     _apply_preset(args)
+    if args.world:
+        try:
+            args.world = str(_resolve_world_path(Path(args.world)))
+        except Exception as exc:
+            ap.error(str(exc))
 
     if args.inspect_world:
         if not args.world: ap.error("--inspect-world requires a world path")
-        world=Path(args.world).expanduser().resolve()
+        world=_resolve_world_path(Path(args.world))
         if not (world/"level.dat").is_file(): ap.error(f"level.dat not found under {world}")
         rendered=json.dumps(inspect_world(world), indent=2)
         print(rendered)
@@ -2159,7 +2780,7 @@ def main()->bool:
 
     if args.verify_world:
         if not args.world: ap.error("--verify-world requires a world path")
-        world=Path(args.world).expanduser().resolve()
+        world=_resolve_world_path(Path(args.world))
         if not (world/"level.dat").is_file(): ap.error(f"level.dat not found under {world}")
         report=verify_world(world); rendered=json.dumps(report, indent=2)
         print(rendered)
@@ -2169,21 +2790,41 @@ def main()->bool:
     if args.headless:
         if not args.world:
             ap.error("--headless requires a world path")
-        world=Path(args.world).expanduser().resolve()
+        world=_resolve_world_path(Path(args.world))
         if not (world/"level.dat").is_file():
             ap.error(f"level.dat not found under {world}")
         selection_path = Path(args.selection).expanduser().resolve() if args.selection else world/".voider-selection.json"
-        if selection_path.exists():
+        if args.all_chunks:
+            # Explicit --all-chunks always overrides a persisted selection file.
+            # This makes the operator's all-world authorization unambiguous.
+            sel_include, sel_exclude = {}, {}
+            args.selection_scope = {
+                _dim_tag(world, directory) for directory in _find_region_dirs(world)
+            }
+            print(
+                "--all-chunks explicitly authorizes every discovered dimension "
+                "after --only/--exclude and coordinate filters."
+            )
+        elif selection_path.is_file():
             try:
                 sel_include, sel_exclude = _load_selection(selection_path)
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 ap.error(f"invalid selection file {selection_path}: {exc}")
-            print(f"Loaded validated selection: {selection_path}")
-        elif args.all_chunks:
-            sel_include, sel_exclude = {}, {}
-            print("No selection file; --all-chunks explicitly authorizes the filtered world scope.")
+            args.selection_scope = set(sel_include) | set(sel_exclude)
+            if not args.selection_scope:
+                ap.error(
+                    f"selection file {selection_path} contains no dimension scopes; "
+                    "use --all-chunks to explicitly authorize the entire world"
+                )
+            print(
+                f"Loaded validated selection: {selection_path} "
+                f"(dimensions: {', '.join(sorted(args.selection_scope))})"
+            )
         else:
-            ap.error("headless mode requires --selection, an existing .voider-selection.json, or --all-chunks")
+            ap.error(
+                "headless mode requires a non-empty --selection, an existing non-empty "
+                ".voider-selection.json, or explicit --all-chunks"
+            )
         rules=_load_rules(world)
         scanned, changed=run_voider(world, sel_include, sel_exclude, args, rules=rules)
         verb="Would void" if args.dry_run else "Voided"
@@ -2197,7 +2838,9 @@ def main()->bool:
             result={"world": str(world), "mode": "dry-run" if args.dry_run else "write",
                     "scanned_chunks": scanned, "changed_chunks": changed,
                     "selection": str(selection_path) if selection_path.exists() else None,
-                    "all_chunks": bool(args.all_chunks), "backup_enabled": bool(args.backup),
+                    "all_chunks": bool(args.all_chunks),
+                    "selection_scope": sorted(getattr(args, "selection_scope", [])),
+                    "backup_enabled": bool(args.backup),
                     "preset": args.preset, "post_write_verification": audit}
             Path(args.report).expanduser().write_text(json.dumps(result, indent=2)+"\n", encoding="utf-8")
         return audit is None or bool(audit["ok"])
@@ -2211,9 +2854,9 @@ def main()->bool:
             if not world_path:
                 return False
 
-        world=Path(world_path)
-        if not (world/"level.dat").exists():
-            print("ERROR: level.dat not found in the selected folder."); return False
+        world=_resolve_world_path(Path(world_path))
+        if not (world/"level.dat").is_file():
+            print("ERROR: selected folder is not a world or recognized server instance."); return False
 
         if args.reset_biomes_dims.strip().lower()=="all":
             dims=[_dim_tag(world, d) for d in _find_region_dirs(world)]
@@ -2266,6 +2909,10 @@ def main()->bool:
         for dimtag,d in sel.items():
             sel_include[dimtag]=set(tuple(x) for x in d.get("include",[]))
             sel_exclude[dimtag]=set(tuple(x) for x in d.get("exclude",[]))
+        args.selection_scope = set(sel_include) | set(sel_exclude)
+        if not args.selection_scope:
+            print("ERROR: Chunk Selector returned no authorized dimensions; refusing to process the world.", file=sys.stderr)
+            return False
 
         rules=_load_rules(world)
 
@@ -2281,11 +2928,14 @@ if __name__ == "__main__":
     except Exception:
         import traceback
         tb=traceback.format_exc()
-        try:
-            import tkinter as tk
-            from tkinter import messagebox
-            tk.Tk().withdraw(); messagebox.showerror("Voider crashed", tb)
-        except Exception:
-            pass
+        # Headless/CLI failures must remain non-interactive. A modal Tk
+        # message box can block subprocesses and CI runners indefinitely.
+        if "--headless" not in sys.argv:
+            try:
+                import tkinter as tk
+                from tkinter import messagebox
+                tk.Tk().withdraw(); messagebox.showerror("Voider crashed", tb)
+            except Exception:
+                pass
         print(tb, file=sys.stderr)
         sys.exit(1)

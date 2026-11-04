@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased — world-safety hardening
+
+### Safety and transaction handling
+- Hold an in-process per-world mutex and the operating-system session lock across each write transaction; fail closed when the lock mechanism is unavailable.
+- Serialize lock-status probes with the per-world mutex so a same-process POSIX `lockf()` probe cannot release an active writer's process-scoped lock.
+- Verify full-world backups with an inventory, CRC checks, per-file SHA-256 manifest, and source-stability checks.
+- Exclude the transient root `session.lock` from backup contents while recording the omission in the manifest, allowing Windows backups to run while the write guard is held.
+- Stage biome reset across all selected region files, verify the result, and roll back committed region files if verification fails.
+- Reject malformed vanilla `Biomes` and GTNH `Biomes16v2` arrays before biome-reset staging can change a region.
+- Treat malformed NBT, chunk-coordinate mismatches, region-worker exceptions, and cancellation as failed/incomplete runs rather than successful skips.
+- Prevent orphan TileEntities by skipping TileEntity-bearing chunks when preservation is requested instead of copying their block entities into empty terrain.
+- Preserve unknown root and Level metadata tags, including GTNH's POSTEA and V, when rebuilding chunks.
+
+### GTNH / Crucible compatibility
+- Recognize GTNH's 512-byte little-endian Biomes16v2 array and 16-bit biome IDs in rules and the chunk selector.
+- Treat a valid Biomes16v2 array as authoritative when present; use legacy Biomes only when the GTNH array is absent.
+- Preserve Biomes16v2 during voiding when present; remove it during provider-safe non-Overworld biome reset.
+- Resolve dedicated-server roots through server.properties / level-name and discover Linux CrucibleServers layouts.
+- Add regressions for extended IDs, metadata preservation, rollback, lock reentrancy, backup manifests, and server-root path traversal.
+- Fail closed on selection files with no dimension scopes; selection runs are limited to named dimensions, and explicit `--all-chunks` overrides saved selections.
+- Keep headless CLI failures non-interactive so a Tk modal cannot stall a command-line run or CI; use a writable file handle for the Windows durability flush.
+
 ## 2.1.0 — 2026-07-21
 
 ### Added
