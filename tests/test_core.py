@@ -372,13 +372,17 @@ class HardeningRegressionTests(unittest.TestCase):
     def test_write_guard_holds_session_lock_across_processes(self):
         with tempfile.TemporaryDirectory(prefix="voider-lock-fixture-") as td:
             world = self._world(Path(td))
-            snippet = (
-                "import pathlib,sys; import main_voider as mv; "
-                "world=pathlib.Path(sys.argv[1]); "
-                "exec('try:\\n with mv._world_write_guard(world): pass\\n'"
-                "     'except RuntimeError as exc:\\n print(exc)\\n raise SystemExit(23)'); "
-                "raise SystemExit(0)"
-            )
+            snippet = "\n".join([
+                "import pathlib,sys",
+                "import main_voider as mv",
+                "world=pathlib.Path(sys.argv[1])",
+                "try:",
+                "    with mv._world_write_guard(world):",
+                "        raise SystemExit(0)",
+                "except RuntimeError as exc:",
+                "    print(exc)",
+                "    raise SystemExit(23)",
+            ])
             env = os.environ.copy()
             env["PYTHONPATH"] = str(Path(mv.__file__).resolve().parent)
             with mv._world_write_guard(world):
