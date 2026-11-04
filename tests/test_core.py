@@ -143,6 +143,24 @@ class BackupTests(unittest.TestCase):
                     self.assertIn("level.dat", zf.namelist())
 
 
+    def test_backup_while_session_lock_is_held_omits_transient_lockfile(self):
+        with tempfile.TemporaryDirectory(prefix="voider-backup-lock-") as td:
+            world = Path(td) / "World"
+            world.mkdir()
+            (world / "level.dat").write_bytes(b"persistent world data")
+            with mv._world_write_guard(world):
+                self.assertTrue((world / "session.lock").exists())
+                archive_path = mv._backup_world_zip(world)
+            with zipfile.ZipFile(archive_path) as archive:
+                self.assertIsNone(archive.testzip())
+                self.assertIn("level.dat", archive.namelist())
+                self.assertNotIn("session.lock", archive.namelist())
+                manifest = json.loads(archive.read(".voider-backup-manifest.json"))
+                self.assertEqual(set(manifest["files"]), {"level.dat"})
+                self.assertEqual(manifest["file_count"], 1)
+                self.assertIn("session.lock", manifest["excluded_files"])
+
+
 class PresetAndVerificationTests(unittest.TestCase):
     def test_safe_void_preset(self):
         args = Namespace(
@@ -844,24 +862,6 @@ class HardeningRegressionTests(unittest.TestCase):
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("Voider did not complete", proc.stderr)
             self.assertNotIn("Traceback", proc.stdout)
-
-
-    def test_backup_skips_transient_session_lock_while_world_lock_is_held(self):
-        with tempfile.TemporaryDirectory(prefix="voider-locked-backup-") as td:
-            world = self._world(Path(td))
-            (world / "level.dat").write_bytes(b"valid backup fixture")
-            with mv._world_write_guard(world):
-                lock_path = world / "session.lock"
-                self.assertTrue(lock_path.is_file())
-                backup = mv._backup_world_zip(world)
-            with zipfile.ZipFile(backup, "r") as archive:
-                self.assertIsNone(archive.testzip())
-                names = set(archive.namelist())
-                self.assertIn("level.dat", names)
-                self.assertNotIn("session.lock", names)
-                manifest = json.loads(archive.read(".voider-backup-manifest.json"))
-                self.assertIn("level.dat", manifest["files"])
-                self.assertNotIn("session.lock", manifest["files"])
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
