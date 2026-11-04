@@ -845,5 +845,23 @@ class HardeningRegressionTests(unittest.TestCase):
             self.assertIn("Voider did not complete", proc.stderr)
             self.assertNotIn("Traceback", proc.stdout)
 
+
+    def test_backup_skips_transient_session_lock_while_world_lock_is_held(self):
+        with tempfile.TemporaryDirectory(prefix="voider-locked-backup-") as td:
+            world = self._world(Path(td))
+            (world / "level.dat").write_bytes(b"valid backup fixture")
+            with mv._world_write_guard(world):
+                lock_path = world / "session.lock"
+                self.assertTrue(lock_path.is_file())
+                backup = mv._backup_world_zip(world)
+            with zipfile.ZipFile(backup, "r") as archive:
+                self.assertIsNone(archive.testzip())
+                names = set(archive.namelist())
+                self.assertIn("level.dat", names)
+                self.assertNotIn("session.lock", names)
+                manifest = json.loads(archive.read(".voider-backup-manifest.json"))
+                self.assertIn("level.dat", manifest["files"])
+                self.assertNotIn("session.lock", manifest["files"])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

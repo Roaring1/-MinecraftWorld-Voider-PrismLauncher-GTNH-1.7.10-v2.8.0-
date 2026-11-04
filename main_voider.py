@@ -1490,6 +1490,10 @@ def _backup_world_zip(world:Path):
     if not world.is_dir() or not (world / "level.dat").is_file():
         raise ValueError(f"Not a Minecraft world folder: {world}")
     manifest_name = ".voider-backup-manifest.json"
+    # session.lock is an ephemeral OS coordination file. It must never be
+    # restored from a backup, and Windows byte-range locking prevents reading
+    # the locked byte while the write guard is held.
+    transient_lock_name = "session.lock"
     stamp = time.strftime("%Y%m%d-%H%M%S")
     destination = world.parent / f"{world.name}.void-backup-{stamp}.zip"
     serial = 1
@@ -1511,10 +1515,12 @@ def _backup_world_zip(world:Path):
                 item = root_path / name
                 if item.is_symlink():
                     raise RuntimeError(f"World backup refuses symlinked file: {item}")
+                relative = item.relative_to(world).as_posix()
+                if relative == transient_lock_name:
+                    continue
                 metadata = item.stat(follow_symlinks=False)
                 if not statmod.S_ISREG(metadata.st_mode):
                     raise RuntimeError(f"World backup refuses non-regular file: {item}")
-                relative = item.relative_to(world).as_posix()
                 result[relative] = (
                     metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns
                 )
