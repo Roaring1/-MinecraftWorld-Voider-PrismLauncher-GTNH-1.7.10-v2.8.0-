@@ -546,27 +546,27 @@ def _get_biomes16v2(raw: bytes) -> Optional[bytes]:
 
 
 def _get_biome_ids(raw: bytes) -> Set[int]:
-    """Read both vanilla 8-bit Biomes and GTNH's 16-bit Biomes16v2 arrays."""
+    """Read GTNH's authoritative Biomes16v2 array, or vanilla Biomes as fallback."""
     nb = _nbt_from_raw(raw)
     if nb is None or "Level" not in nb:
         return set()
     level = nb["Level"]
-    biome_ids: Set[int] = set()
     try:
+        extended = level.get("Biomes16v2")
+        if extended is not None:
+            if not isinstance(extended, nbt.TAG_Byte_Array) or len(extended.value) != 512:
+                return set()
+            data = bytes(extended.value)
+            return {
+                data[index] | (data[index + 1] << 8)
+                for index in range(0, len(data), 2)
+            }
         standard = level.get("Biomes")
         if isinstance(standard, nbt.TAG_Byte_Array) and len(standard.value) == 256:
-            biome_ids.update(int(value) & 0xFF for value in standard.value)
-        extended = level.get("Biomes16v2")
-        if isinstance(extended, nbt.TAG_Byte_Array):
-            data = bytes(extended.value)
-            if len(data) == 512:
-                biome_ids.update(
-                    data[index] | (data[index + 1] << 8)
-                    for index in range(0, len(data), 2)
-                )
+            return {int(value) & 0xFF for value in standard.value}
     except Exception:
         return set()
-    return biome_ids
+    return set()
 
 def _has_entities(raw:bytes) -> Tuple[bool,bool]:
     nb = _nbt_from_raw(raw)
